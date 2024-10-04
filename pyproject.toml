@@ -1,0 +1,24 @@
+[project]
+name = "Wav2FacsTimeline"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pip",
+  "imageio",
+  "jaxtyping",
+  "tensorboardX",
+  "llvmlite==0.43",
+  "librosa<1.0",  # librosa 1.0.0 will remove audioread backend
+  "torch>=2.0.0",
+  "py-feat",
+  "nltools>=0.5.1",
+  "lightning",
+  "opencv-python",
+  "numpy<2.0.0",
+  "tqdm",
+  "transformers",
+  "diffusers",
+  "h5py",
+]
