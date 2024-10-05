@@ -25,7 +25,7 @@ class ShortTermTemporalModule(nn.Module):
             num_heads (int): The number of heads in the multi-head attention
         """
         super(ShortTermTemporalModule, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads * 3)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, frame_features, key_padding_mask):
@@ -202,6 +202,25 @@ class DiffusionModel(nn.Module):
         return x
 
 
+class EmotionConstraintLayer(torch.nn.Module):
+    """Emotion Constraint Layer
+
+    The sumulation of the emotion columns should be 1.
+    """
+
+    def __init__(self):
+        super(EmotionConstraintLayer, self).__init__()
+
+    def forward(self, x):
+        # type: (Float[Array, "batch", "seq_len", "embed_dim"]) -> Float[Array, "batch", "seq_len", "embed_dim"]
+        # カラム21から27にソフトマックスを適用して和が1になるようにする
+        emotion_outputs = x[:, 21:28]
+        emotion_outputs = torch.nn.functional.softmax(emotion_outputs, dim=1)
+        # 出力を結合して返す
+        x[:, 21:28] = emotion_outputs
+        return x
+
+
 class SpeechToExpressionModel(pl.LightningModule):
     """Temporal Diffusion Speaker Model"""
 
@@ -223,10 +242,12 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
         self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_speakers)
         self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
+        self.emotion_constraint_layer = EmotionConstraintLayer()
         self.num_steps = num_steps
         self.lr = lr
+        self.emotion_constraint_penalty = 0.1
 
-        self.save_hyperparameters()  # ハイパーパラメータの保存（任意）
+        self.save_hyperparameters()
 
     def forward(
             self,
@@ -273,11 +294,12 @@ class SpeechToExpressionModel(pl.LightningModule):
         attention_output = attention_output.permute(1, 0, 2)  # type: Float[Array, "batch_size", seq_len, embed_dim]
 
         # Generate random timesteps for diffusion
-        batch_size = attention_output.size(0)
+        batch_size = attention_output.shape[0]
         t = torch.randint(0, self.num_steps, (batch_size,), device=attention_output.device)
         denoised_output, _ = self.diffusion(attention_output, t)
+        constrained_output = self.emotion_constraint_layer(denoised_output)
 
-        final_output = denoised_output[:, -1, :]  # Only return the final frame output
+        final_output = constrained_output [:, -1, :]  # Only return the final frame output
         # final_output = final_output.permute(1, 0, 2)  # permute back to (batch_size, seq_len, embed_dim)
         
         return final_output
@@ -297,11 +319,19 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         frame_features, global_frame_features, frame_masks, global_frame_masks, labels = batch
-        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks)
+        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks)  # type: Float[Array, "batch_size", "embed_dim"]
+        labels = labels.expand(outputs.shape[0], -1)  # extend to batch dimension
 
-        # extend to batch dimension
-        labels = labels.expand(outputs.size(0), -1)
+        # Calculate the mean squared error loss
         loss = nn.functional.mse_loss(outputs, labels)
+
+        # Introduce the constraint of sum of the emotions should be 1
+        # the col 21 to 27 are the emotion columns
+        emotion_sum = torch.sum(outputs[:, 21:28], dim=1)
+        emo_loss = nn.functional.mse_loss(emotion_sum, torch.ones_like(emotion_sum)) * self.emotion_constraint_penalty
+
+        loss += emo_loss
+        self.log("train_emo_loss", emo_loss)
         self.log("train_loss", loss)
 
         return loss
@@ -317,8 +347,8 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         frame_features, global_frame_features, frame_masks, global_frame_masks, labels = batch
-        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks)
-        labels = labels.expand(outputs.size(0), -1)
+        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks) # type: Float[Array, "batch_size", "embed_dim"]
+        labels = labels.expand(outputs.shape[0], -1)
         val_loss = nn.functional.mse_loss(outputs, labels)
         self.log("val_loss", val_loss)
 
