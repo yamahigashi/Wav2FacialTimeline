@@ -30,19 +30,11 @@ def parse_args():
 
 def load_model(checkpoint_path, device):
     """Load the pre-trained model from a checkpoint and move it to the specified device."""
-    model = SpeechToExpressionModel(
-        embed_dim=768,
-        output_dim=31,
-        num_heads=8,
-        num_steps=1010,
-        num_layers=2,
-        num_speakers=1,
-        lr=1e-3
-    )
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    hparams = checkpoint["hyper_parameters"]
+    model = SpeechToExpressionModel(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
-    model.eval().to(device)  # Move model to the device (GPU/CPU)
-
+    model.eval().to(device)
     return model
 
 
