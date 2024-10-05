@@ -113,9 +113,51 @@ def save_output(output, output_file_path):
 
 def save_output_to_csv(results, output_file_path):
     """Save inference output to a CSV file using Pandas."""
+
+    au_columns = [
+        "AU01",
+        "AU02",
+        "AU04",
+        "AU05",
+        "AU06",
+        "AU07",
+        "AU09",
+        "AU10",
+        "AU11",
+        "AU12",
+        "AU14",
+        "AU15",
+        "AU17",
+        "AU20",
+        "AU23",
+        "AU24",
+        "AU25",
+        "AU26",
+        "AU28",
+        "AU43",
+    ]
+
+    emotion_columns = [
+        "Anger",
+        "Disgust",
+        "Fear",
+        "Happiness",
+        "Sadness",
+        "Surprise",
+        "Neutral",
+    ]
+
+    poses_columns = [
+        "Pitch",
+        "Roll",
+        "Yaw",
+    ]
+
+    columns = ["FaceScore"] + au_columns + emotion_columns + poses_columns
+
     # Convert the list of tensors into a flat list and then a DataFrame
     flat_results = [np.round(tensor.numpy().flatten(), 3) for tensor in results]  # Flatten the tensors
-    df = pd.DataFrame(flat_results)  # Create a DataFrame
+    df = pd.DataFrame(flat_results, columns=columns)
 
     # Save the DataFrame to a CSV file
     df.to_csv(output_file_path, index=False)
