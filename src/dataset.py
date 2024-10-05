@@ -20,22 +20,21 @@ class SpeakerDataset(Dataset):
             short_term_window (int): Number of frames to consider in short-term memory.
             long_term_window (int): Number of frames to consider in long-term memory.
         """
-        self.hdf5_file = hdf5_file
+        self.hdf5_file = h5py.File(hdf5_file, "r")
         self.embed_dim = embed_dim
         self.short_term_window = short_term_window
         self.long_term_window = long_term_window
 
         # Open HDF5 file and retrieve all file names (keys) stored in the dataset
-        with h5py.File(hdf5_file, "r") as f:
-            self.file_keys = list(f.keys())  # Each key corresponds to one file's dataset
-            self.file_frame_offsets = []
-            total_frames = 0
+        self.file_keys = list(self.hdf5_file.keys())
+        self.file_frame_offsets = []
+        total_frames = 0
 
-            # Calculate the total number of frames and the offset for each file
-            for file_key in self.file_keys:
-                num_frames = f[f"{file_key}/facial_expression"].shape[0]
-                self.file_frame_offsets.append((file_key, total_frames, total_frames + num_frames))
-                total_frames += num_frames
+        # Calculate the total number of frames and the offset for each file
+        for file_key in self.file_keys:
+            num_frames = self.hdf5_file[f"{file_key}/facial_expression"].shape[0]
+            self.file_frame_offsets.append((file_key, total_frames, total_frames + num_frames))
+            total_frames += num_frames
 
         self.total_frames = total_frames
 
@@ -65,10 +64,9 @@ class SpeakerDataset(Dataset):
         """Retrieve a data sample for the given frame index."""
 
         file_key, file_frame_idx = self._get_file_index(idx)
-        with h5py.File(self.hdf5_file, "r") as f:
-            # Load the specific file's facial expression and audio feature datasets
-            facial_expressions = f[f"{file_key}/facial_expression"][:]
-            audio_features = f[f"{file_key}/audio_feature"][:]
+        # Load the specific file's facial expression and audio feature datasets
+        facial_expressions = self.hdf5_file[f"{file_key}/facial_expression"][:]
+        audio_features = self.hdf5_file[f"{file_key}/audio_feature"][:]
 
         # Short-term memory: Use the previous short_term_window frames
         if file_frame_idx < self.short_term_window:
@@ -92,3 +90,7 @@ class SpeakerDataset(Dataset):
             long_term_features = torch.zeros(1, self.embed_dim)
 
         return short_term_features, long_term_features, short_frame_mask, long_frame_mask, labels
+
+    def __del__(self):
+        """Close the HDF5 file when the dataset is deleted."""
+        self.hdf5_file.close()
