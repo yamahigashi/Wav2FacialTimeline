@@ -20,21 +20,27 @@ class SpeakerDataset(Dataset):
             short_term_window (int): Number of frames to consider in short-term memory.
             long_term_window (int): Number of frames to consider in long-term memory.
         """
-        self.hdf5_file = h5py.File(hdf5_file, "r")
+        self.hdf5_file_path = hdf5_file
         self.embed_dim = embed_dim
         self.short_term_window = short_term_window
         self.long_term_window = long_term_window
 
         # Open HDF5 file and retrieve all file names (keys) stored in the dataset
-        self.file_keys = list(self.hdf5_file.keys())
-        self.file_frame_offsets = []
-        total_frames = 0
+        self.hdf5_file = h5py.File(hdf5_file, "r")
+        self.hdf5_file = None
+        self._initialize_file_offsets()
 
-        # Calculate the total number of frames and the offset for each file
-        for file_key in self.file_keys:
-            num_frames = self.hdf5_file[f"{file_key}/facial_expression"].shape[0]
-            self.file_frame_offsets.append((file_key, total_frames, total_frames + num_frames))
-            total_frames += num_frames
+    def _initialize_file_offsets(self):
+        """Initialize file offsets for all files in the dataset."""
+        with h5py.File(self.hdf5_file_path, "r") as f:
+            self.file_keys = list(f.keys())
+            self.file_frame_offsets = []
+            total_frames = 0
+
+            for file_key in self.file_keys:
+                num_frames = f[f"{file_key}/facial_expression"].shape[0]
+                self.file_frame_offsets.append((file_key, total_frames, total_frames + num_frames))
+                total_frames += num_frames
 
         self.total_frames = total_frames
 
@@ -62,6 +68,9 @@ class SpeakerDataset(Dataset):
     def __getitem__(self, idx):
         # type: (int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         """Retrieve a data sample for the given frame index."""
+
+        if self.hdf5_file is None:
+            raise RuntimeError("HDF5 file is not opened. Ensure `worker_init_fn` is used to open the file in each worker.")
 
         file_key, file_frame_idx = self._get_file_index(idx)
         # Load the specific file's facial expression and audio feature datasets
@@ -91,6 +100,13 @@ class SpeakerDataset(Dataset):
 
         return short_term_features, long_term_features, short_frame_mask, long_frame_mask, labels
 
-    def __del__(self):
-        """Close the HDF5 file when the dataset is deleted."""
-        self.hdf5_file.close()
+
+def open_hdf5_file(_worker_id):
+    """Initialize the worker process by opening the HDF5 file.
+
+    Using this function as the `worker_init_fn` ensures that each worker opens the file
+    in the DataLoader initialization process.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    dataset = worker_info.dataset
+    dataset.hdf5_file = h5py.File(dataset.hdf5_file_path, "r")
