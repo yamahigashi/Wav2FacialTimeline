@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -63,24 +64,53 @@ class LongTermTemporalModule(nn.Module):
 
     def forward(self, global_frame_features, src_key_padding_mask):
         # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
-        """
+        """Forward pass of the LongTermTemporalModule
+
+        The input features should be in the sequence-first format, Transfomer expects the input to be
+        (sequence_length, batch_size, embed_dim). The output is also in the same format. Then it is
+        converted back to the batch-first format.
+
         Args:
-            global_frame_features (torch.Tensor): Tensor of shape 
-                (num_long_term_frames, batch_size, embed_dim)
+            global_frame_features (torch.Tensor): The input global frame features
+            src_key_padding_mask (torch.Tensor): The key padding mask for the input features
+
         Returns:
             torch.Tensor: Output of the transformer encoder
         """
 
-        # Pass the long-term frame features through the Transformer encoder
         attn_output = self.transformer_encoder(
             global_frame_features,
             src_key_padding_mask=src_key_padding_mask
         )
         
-        # Apply layer normalization after the attention output
         output = self.layer_norm(attn_output)
         
         return output
+
+
+class PositionalEncoding(nn.Module):
+    """Positional Encoding Module"""
+
+    def __init__(self, embed_dim, max_len=5000):
+        # type: (int, int) -> None
+
+        super(PositionalEncoding, self).__init__()
+
+        pe = torch.zeros(max_len, embed_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-np.log(10000.0) / embed_dim))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+
+        pos = self.pe.expand(x.shape[1], -1, -1).transpose(0, 1)
+        x = x + pos[:x.shape[0], :, :]
+        return x
 
 
 class BiasedConditionalSelfAttention(nn.Module):
@@ -213,10 +243,13 @@ class EmotionConstraintLayer(torch.nn.Module):
 
     def forward(self, x):
         # type: (Float[Array, "batch", "seq_len", "embed_dim"]) -> Float[Array, "batch", "seq_len", "embed_dim"]
+
         # カラム21から27にソフトマックスを適用して和が1になるようにする
         emotion_outputs = x[:, 21:28]
         emotion_outputs = torch.nn.functional.softmax(emotion_outputs, dim=1)
-        # 出力を結合して返す
+
+        # avoid in-place operation
+        x = x.clone()  # type: ignore
         x[:, 21:28] = emotion_outputs
         return x
 
@@ -240,12 +273,15 @@ class SpeechToExpressionModel(pl.LightningModule):
         
         self.short_term_module = ShortTermTemporalModule(embed_dim, num_heads)
         self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
+        self.positional_encoding = PositionalEncoding(embed_dim)
         self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_speakers)
         self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
         self.emotion_constraint_layer = EmotionConstraintLayer()
         self.num_steps = num_steps
         self.lr = lr
-        self.emotion_constraint_penalty = 0.1
+        self.emotion_constraint_penalty = 0.001
+
+        self.memory_weights = nn.Parameter(torch.ones(2))
 
         self.save_hyperparameters()
 
@@ -286,7 +322,12 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         short_term_output = self.short_term_module(frame_features, frame_masks)
         long_term_output = self.long_term_module(global_frame_features, global_frame_masks)
-        combined_features = torch.cat((short_term_output, long_term_output), dim=0)
+
+        weights = torch.softmax(self.memory_weights, dim=0)
+        weighted_short_term = weights[0] * short_term_output
+        weighted_long_term = weights[1] * long_term_output
+        combined_features = torch.cat((weighted_short_term, weighted_long_term), dim=0)
+        combined_features = self.positional_encoding(combined_features)
 
         attention_output = self.biased_attention(combined_features, speaker_labels)
 
@@ -330,9 +371,13 @@ class SpeechToExpressionModel(pl.LightningModule):
         emotion_sum = torch.sum(outputs[:, 21:28], dim=1)
         emo_loss = nn.functional.mse_loss(emotion_sum, torch.ones_like(emotion_sum)) * self.emotion_constraint_penalty
 
+        weights = torch.softmax(self.memory_weights, dim=0)
+
         loss += emo_loss
         self.log("train_emo_loss", emo_loss)
         self.log("train_loss", loss)
+        self.log("short_term_weight", weights[0])
+        self.log("long_term_weight", weights[1])
 
         return loss
 

@@ -1,4 +1,7 @@
+import pathlib
 import argparse
+import multiprocessing
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -6,20 +9,24 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from dataset import SpeakerDataset
+from dataset import (
+    SpeakerDataset,
+    open_hdf5_file,
+)
 from model import SpeechToExpressionModel
 
 
 def parse_args():
     # type: () -> argparse.Namespace
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Train Temporal Diffusion Speaker Model")
+    parser = argparse.ArgumentParser(description="Train Speech to Expression model.")
     
     # Dataset and model arguments
     parser.add_argument("--hdf5_file", type=str, required=True, help="Path to the HDF5 file.")
     parser.add_argument("--embed_dim", type=int, default=512, help="Embedding dimension for Transformer layers.")
     parser.add_argument("--short_term_window", type=int, default=5, help="Number of short-term frames.")
     parser.add_argument("--long_term_window", type=int, default=100, help="Number of long-term frames.")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to the checkpoint to resume training.")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
@@ -93,14 +100,33 @@ def prepare_dataloaders(hdf5_file, embed_dim, short_term_window, long_term_windo
         short_term_window=short_term_window, 
         long_term_window=long_term_window
     )
+
+    num_workers = multiprocessing.cpu_count() // 2
     
     # Train-test split (simple version, adjust as needed)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        worker_init_fn=open_hdf5_file,
+        persistent_workers=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        worker_init_fn=open_hdf5_file,
+        persistent_workers=True
+    )
     
     return train_loader, val_loader
 
@@ -116,18 +142,24 @@ def main():
         args.batch_size
     )
 
-    # Initialize the model
-    model = SpeechToExpressionModel(
-        embed_dim=args.embed_dim,
-        output_dim=31,
-        num_heads=args.num_heads,
-        num_steps=args.num_steps,
-        num_layers=args.num_layers,
-        lr=args.learning_rate
-    )
+    if args.resume_checkpoint:
+        # Load the model from a checkpoint
+        model = SpeechToExpressionModel.load_from_checkpoint(args.resume_checkpoint)
+
+    else:
+        # Initialize the model
+        model = SpeechToExpressionModel(
+            embed_dim=args.embed_dim,
+            output_dim=31,
+            num_heads=args.num_heads,
+            num_steps=args.num_steps,
+            num_layers=args.num_layers,
+            lr=args.learning_rate
+        )
 
     # Set up logging using TensorBoard
-    logger = TensorBoardLogger("tb_logs", name="temporal_diff_speaker_model")
+    log_dir = pathlib.Path(__file__).parent.parent / "logs"
+    logger = TensorBoardLogger(log_dir.as_posix(), name="speech_to_expression")
 
     # Set up checkpoints to save the best model
     checkpoint_callback = ModelCheckpoint(
@@ -150,9 +182,6 @@ def main():
 
     # Train the model
     trainer.fit(model, train_loader, val_loader)
-
-    # Save the best model
-    best_model_path = checkpoint_callback.best_model_path
 
 
 if __name__ == "__main__":
