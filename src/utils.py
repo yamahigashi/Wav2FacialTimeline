@@ -1,3 +1,7 @@
+import os
+import tempfile
+import pathlib
+
 import cv2
 import librosa
 import torch
@@ -18,12 +22,47 @@ def extract_facial_expression(file, feat_detector):
     scores = frame_data["FaceScore"]
     au_features = frame_data.aus
     emotions = frame_data.emotions
-    poses = frame_data.facepose
+    poses = frame_data.poses
     poses = poses.diff().fillna(0)  # Calculate the difference between consecutive frames
 
     expression = pd.concat([scores, au_features, emotions, poses], axis=1)
 
     return expression
+
+
+def is_video_reliable(video_file, feat_detector):
+    # type: (str, Detector) -> bool
+    """Check if the video is reliable by examining the face scores."""
+
+    cap = cv2.VideoCapture(video_file)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return False
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+        temp_path = temp_file.name
+        cv2.imwrite(temp_file.name, frame)
+
+    try:
+        frame_data = feat_detector.detect_image(temp_file.name)
+        face_scores = frame_data["FaceScore"]
+        yaw = frame_data.poses["Yaw"]
+
+        if face_scores.empty:
+            return False
+
+        if face_scores.mean() < 0.97:
+            return False
+
+        if yaw.abs().mean() > 30:
+            return False
+
+    finally:
+        os.unlink(temp_path)
+
+    return True
 
 
 def resample_data(data, target_length, columns=None):
