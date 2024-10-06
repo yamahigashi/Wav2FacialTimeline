@@ -10,6 +10,7 @@ dependencies = [
   "jaxtyping",
   "tensorboardX",
   "llvmlite==0.43",
+  "scikit-learn==1.2.2",
   "librosa<1.0",  # librosa 1.0.0 will remove audioread backend
   "torch>=2.0.0",
   "py-feat",
