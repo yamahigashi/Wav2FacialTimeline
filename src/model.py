@@ -11,7 +11,13 @@ if typing.TYPE_CHECKING:
     from jaxtyping import (
         Float,  # noqa: F401
         Array,  # noqa: F401
+        Int,  # noqa: F401
     )
+    from dataset import (
+        Batch,  # noqa: F401
+    )
+
+MAX_WINDOW_SIZE = 600
 
 
 class ShortTermTemporalModule(nn.Module):
@@ -91,43 +97,71 @@ class LongTermTemporalModule(nn.Module):
 class PositionalEncoding(nn.Module):
     """Positional Encoding Module"""
 
-    def __init__(self, embed_dim, max_len=5000):
+    def __init__(self, embed_dim, max_len=MAX_WINDOW_SIZE):
         # type: (int, int) -> None
 
         super(PositionalEncoding, self).__init__()
 
-        pe = torch.zeros(max_len, embed_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-np.log(10000.0) / embed_dim))
+        # Embeddings layer for relative positional encoding
+        self.relative_position_embeddings = nn.Embedding(2 * max_len - 1, embed_dim)
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        # Embeddings layer for temporal encoding, 3 values: past, present, future
+        self.temporal_embeddings = nn.Embedding(3, embed_dim)
 
-        self.register_buffer("pe", pe)
+        self.max_len = max_len
 
-    def forward(self, x):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+    def forward(self, x, current_frame_idx):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Int[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+        """
+        Forward pass for combined relative positional encoding and temporal encoding.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (seq_len, batch_size, embed_dim)
+            current_frame_idx (int): The index of the current frame in the sequence (center of past and future).
+            
+        Returns:
+            torch.Tensor: The input tensor with relative positional encodings and temporal encodings added.
+        """
+        seq_len, batch_size, embed_dim = x.size()
 
-        pos = self.pe.expand(x.shape[1], -1, -1).transpose(0, 1)
-        x = x + pos[:x.shape[0], :, :]
+        assert seq_len <= self.max_len, "Sequence length exceeds maximum length."
+
+        # 1. Encode relative positions
+        positions = torch.arange(seq_len, dtype=torch.long, device=x.device)
+        relative_positions = positions.view(-1, 1) - positions.view(1, -1)
+        relative_positions += (self.max_len - 1)  # Shift to positive values
+        relative_position_encodings = self.relative_position_embeddings(relative_positions)  # (seq_len, seq_len, embed_dim)
+
+        # Expand to match the batch size
+        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)
+
+        # 2. Encode temporal positions
+        temporal_indices = torch.full((seq_len, batch_size), 0, device=x.device, dtype=torch.long)  # present frame: 0
+
+        # Make the past frames -1 and future frames 1
+        for b in range(batch_size):
+            current_idx = current_frame_idx[b].item()
+            temporal_indices[:current_idx, b] = -1  # past frames: -1
+            temporal_indices[current_idx + 1:, b] = 1  # future frames: 1
+
+        # 時間エンコーディングのインデックスに基づいて値を取得 (seq_len, batch_size, embed_dim)
+        temporal_encoding = self.temporal_embeddings(temporal_indices)  # (seq_len, batch_size, embed_dim)
+
+        # 3. Add the positional encodings to the input features
+        x = x + temporal_encoding + relative_position_encodings[:, :, torch.arange(seq_len), :].sum(dim=2)
         return x
 
 
 class BiasedConditionalSelfAttention(nn.Module):
-    """Biased Conditional Self-Attention"""
+    """Biased Conditional Self-Attention with Transformer"""
 
-    def __init__(self, embed_dim, num_heads, num_speakers=None, bias_factor=0.1):
-        # type: (int, int, int | None, float) -> None
-        """Initialize the BiasedConditionalSelfAttention
-
-        Args:
-            embed_dim (int): The input feature dimension
-            num_heads (int): The number of heads in the multi-head attention
-            bias_factor (float): The bias factor to be applied to the attention output
-        """
+    def __init__(self, embed_dim, num_heads, num_layers, num_speakers=None, bias_factor=0.1):
         super(BiasedConditionalSelfAttention, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
         self.bias_factor = bias_factor
+
+        # Transformerエンコーダーの定義
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
         if num_speakers is not None:
@@ -273,7 +307,8 @@ class SpeechToExpressionModel(pl.LightningModule):
         
         self.short_term_module = ShortTermTemporalModule(embed_dim, num_heads)
         self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
-        self.positional_encoding = PositionalEncoding(embed_dim)
+        self.short_positional_encoding = PositionalEncoding(embed_dim)
+        self.long_positional_encoding = PositionalEncoding(embed_dim)
         self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_speakers)
         self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
         self.emotion_constraint_layer = EmotionConstraintLayer()
@@ -289,11 +324,13 @@ class SpeechToExpressionModel(pl.LightningModule):
             self,
             frame_features,
             global_frame_features,
-            frame_masks=None,
-            global_frame_masks=None,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
             speaker_labels=None
     ):
-        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor|None) -> torch.Tensor
+        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor|None) -> torch.Tensor
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -326,8 +363,9 @@ class SpeechToExpressionModel(pl.LightningModule):
         weights = torch.softmax(self.memory_weights, dim=0)
         weighted_short_term = weights[0] * short_term_output
         weighted_long_term = weights[1] * long_term_output
-        combined_features = torch.cat((weighted_short_term, weighted_long_term), dim=0)
-        combined_features = self.positional_encoding(combined_features)
+        encoded_short_term = self.short_positional_encoding(weighted_short_term, current_short_frame)
+        encoded_long_term = self.long_positional_encoding(weighted_long_term, current_long_frame)
+        combined_features = torch.cat((encoded_short_term, encoded_long_term), dim=0)
 
         attention_output = self.biased_attention(combined_features, speaker_labels)
 
@@ -346,7 +384,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         return final_output
 
     def training_step(self, batch, batch_idx):
-        # type: (Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], int) -> torch.Tensor
+        # type: (Batch, int) -> torch.Tensor
         """Training step of the SpeechToExpressionModel
 
         Lightning calls this method during the training loop.
@@ -359,8 +397,24 @@ class SpeechToExpressionModel(pl.LightningModule):
             torch.Tensor: The loss value for the training step
         """
 
-        frame_features, global_frame_features, frame_masks, global_frame_masks, labels = batch
-        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks)  # type: Float[Array, "batch_size", "embed_dim"]
+        (
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
+            labels
+        ) = batch
+
+        outputs = self(
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame
+        ) # type: Float[Array, "batch_size", "embed_dim"]
         labels = labels.expand(outputs.shape[0], -1)  # extend to batch dimension
 
         # Calculate the mean squared error loss
@@ -382,7 +436,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # type: (Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], int) -> None
+        # type: (Batch, int) -> None
         """Validation step of the SpeechToExpressionModel
         Lightning calls this method during the validation loop.
 
@@ -391,8 +445,24 @@ class SpeechToExpressionModel(pl.LightningModule):
             batch_idx (int): The index of the batch
         """
 
-        frame_features, global_frame_features, frame_masks, global_frame_masks, labels = batch
-        outputs = self(frame_features, global_frame_features, frame_masks, global_frame_masks) # type: Float[Array, "batch_size", "embed_dim"]
+        (
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
+            labels
+        ) = batch
+
+        outputs = self(
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame
+        ) # type: Float[Array, "batch_size", "embed_dim"]
         labels = labels.expand(outputs.shape[0], -1)
         val_loss = nn.functional.mse_loss(outputs, labels)
         self.log("val_loss", val_loss)
