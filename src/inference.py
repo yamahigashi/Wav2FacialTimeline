@@ -48,6 +48,11 @@ def preprocess_inference_data(audio_path, batch_size=1):
     wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
 
     audio_features = utils.extract_audio_features(audio_path, wav2vec_processor, wav2vec_model)[0]
+    target_audio_length = int(audio_features.shape[0] * 30 / 50)  # 50 fps is the default rate for Wav2Vec2
+    audio_features = utils.resample_data(
+            audio_features.detach().cpu().numpy(),
+            target_length=target_audio_length)
+
     num_frames = audio_features.shape[0]
 
     short_term_batch, long_term_batch = [], []
