@@ -129,26 +129,37 @@ class PositionalEncoding(nn.Module):
         # 1. Encode relative positions
         positions = torch.arange(seq_len, dtype=torch.long, device=x.device)
         relative_positions = positions.view(-1, 1) - positions.view(1, -1)
-        relative_positions += (self.max_len - 1)  # Shift to positive values
-        relative_position_encodings = self.relative_position_embeddings(relative_positions)  # (seq_len, seq_len, embed_dim)
-
-        # Expand to match the batch size
-        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)
-
+        relative_positions += self.max_len - 1  # Shift to positive values for embedding lookup
+        
+        # Get relative position encodings: (seq_len, seq_len, embed_dim)
+        relative_position_encodings = self.relative_position_embeddings(relative_positions)
+        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)  # (seq_len, batch_size, seq_len, embed_dim)
+        
         # 2. Encode temporal positions
-        temporal_indices = torch.full((seq_len, batch_size), 0, device=x.device, dtype=torch.long)  # present frame: 0
-
-        # Make the past frames -1 and future frames 1
-        for b in range(batch_size):
-            current_idx = current_frame_idx[b].item()
-            temporal_indices[:current_idx, b] = -1  # past frames: -1
-            temporal_indices[current_idx + 1:, b] = 1  # future frames: 1
-
-        # 時間エンコーディングのインデックスに基づいて値を取得 (seq_len, batch_size, embed_dim)
-        temporal_encoding = self.temporal_embeddings(temporal_indices)  # (seq_len, batch_size, embed_dim)
-
-        # 3. Add the positional encodings to the input features
-        x = x + temporal_encoding + relative_position_encodings[:, :, torch.arange(seq_len), :].sum(dim=2)
+        temporal_indices = torch.zeros((seq_len, batch_size), device=x.device, dtype=torch.long)  # initialize temporal indices to 0 (current frame)
+        
+        # Create a matrix representing the frame indices (seq_len, 1)
+        frame_index_matrix = torch.arange(seq_len, device=x.device).unsqueeze(1)  # type: Int[Array, "seq_len", 1]
+        
+        # Use broadcasting to compare with current_frame_idx and assign 0 (past) 1 (current) 2 (future)
+        past_mask = frame_index_matrix < current_frame_idx.unsqueeze(0)
+        current_mask = frame_index_matrix == current_frame_idx.unsqueeze(0)
+        future_mask = frame_index_matrix > current_frame_idx.unsqueeze(0)
+        
+        # Set past and future indices
+        temporal_indices[past_mask] = 0
+        temporal_indices[current_mask] = 1
+        temporal_indices[future_mask] = 2
+        
+        # Retrieve temporal encodings based on temporal indices (seq_len, batch_size, embed_dim)
+        temporal_encoding = self.temporal_embeddings(temporal_indices)  # Temporal embeddings are looked up using batched indices
+        
+        # 3. Combine relative position encodings and temporal encodings
+        # Sum across all relative position encodings for each batch and sequence index
+        relative_position_sum = relative_position_encodings.sum(dim=2)  # Sum along seq_len dimension: (seq_len, batch_size, embed_dim)
+        
+        # Add temporal encoding and relative position encoding to input x
+        x = x + temporal_encoding + relative_position_sum
         return x
 
 
@@ -170,31 +181,22 @@ class BiasedConditionalSelfAttention(nn.Module):
             self.speaker_embeddings = None
 
     def forward(self, input_features, speaker_info=None):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "embed_dim"]|None) -> Float[Array, "seq_len", "batch", "embed_dim"]
-        """Forward pass of the BiasedConditionalSelfAttention
+        # input_features: (seq_len, batch_size, embed_dim)
 
-        Args:
-            x (torch.Tensor): The input features
-            condition (torch.Tensor): The conditional input features
+        # Transformerエンコーダーの適用
+        attn_output = self.transformer_encoder(input_features)
 
-        Returns:
-            torch.Tensor: The output features
-        """
-
-        attn_output, _ = self.attention(input_features, input_features, input_features)
-
+        # スピーカーバイアスの適用
         if speaker_info is not None:
-
             if self.speaker_embeddings is not None and speaker_info.dim() == 1:
-                speaker_embed = self.speaker_embeddings(speaker_info).unsqueeze(0)
+                speaker_embed = self.speaker_embeddings(speaker_info).unsqueeze(0)  # (1, batch_size, embed_dim)
             else:
-                speaker_embed = speaker_info.unsqueeze(0)
+                speaker_embed = speaker_info.unsqueeze(0)  # (1, batch_size, embed_dim)
 
             bias = speaker_embed * self.bias_factor
-            attn_output += bias
+            attn_output = attn_output + bias  # seq_len方向にブロードキャスト
 
-        output = self.layer_norm(input_features + attn_output)
-
+        output = self.layer_norm(attn_output)
         return output
 
 
@@ -309,7 +311,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
         self.short_positional_encoding = PositionalEncoding(embed_dim)
         self.long_positional_encoding = PositionalEncoding(embed_dim)
-        self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_speakers)
+        self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_layers, num_speakers)
         self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
         self.emotion_constraint_layer = EmotionConstraintLayer()
         self.num_steps = num_steps
