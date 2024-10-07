@@ -20,11 +20,11 @@ def parse_args():
     # type: () -> argparse.Namespace
 
     parser = argparse.ArgumentParser(description="Preprocess dataset")
-    parser.add_argument("--input_dir", type=str, required=True, help="Path to the input directory containing video files")
-    parser.add_argument("--output_file", type=str, required=True, help="Path to the output HDF5 file")
+    parser.add_argument("--input_dir", type=str, help="Path to the input directory containing video files")
+    parser.add_argument("--output_file", type=str, help="Path to the output HDF5 file")
     parser.add_argument("--frame_rate", type=int, default=30, help="Frame rate for the output video")
-    parser.add_argument("--check_file", action="store_true", help="Check the contents of the HDF5 file", default=False)
-    parser.add_argument("--audio_dir", type=str, required=False, help="Path to the directory containing audio files")
+    parser.add_argument("--audio_dir", type=str, help="Path to the directory containing audio files")
+    parser.add_argument("--repair", action="store_true", help="Check the contents of the HDF5 file", default=False)
 
     return parser.parse_args()
 
@@ -86,7 +86,10 @@ def preprocess(movie_dir, output_file, frame_rate, audio_dir=None):
             file_names = []
 
         # for idx, file in enumerate(pathlib.Path(movie_dir).rglob("01-*.mp4")):
-        for idx, file in enumerate(pathlib.Path(movie_dir).rglob("*.mp4")):
+        # files = list(pathlib.Path(movie_dir).rglob("**/front/**/*.mp4"))
+        files = list(pathlib.Path(movie_dir).rglob("*.mp4"))
+        random.shuffle(files)
+        for idx, file in enumerate(files):
             file_key = file.as_posix().replace("/", "_")
             if file_key in file_names:
                 print(f"Skipping {file}")
@@ -187,7 +190,11 @@ def repair_nan_inf_to_minus_one(file_path):
 
 def main():
     args = parse_args()
-    preprocess(args.input_dir, args.output_file, args.frame_rate, args.audio_dir)
+
+    if args.repair:
+        repair_nan_inf_to_minus_one(args.output_file)
+    else:
+        preprocess(args.input_dir, args.output_file, args.frame_rate, args.audio_dir)
 
 
 if __name__ == "__main__":

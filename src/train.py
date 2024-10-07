@@ -15,11 +15,15 @@ from dataset import (
 )
 from model import SpeechToExpressionModel
 
+        
+tpu_available = False
 try:
+    import torch_xla.distributed.parallel_loader as pl
     import torch_xla.core.xla_model as xm
-    if xm.xla_device_hw() == 'TPU':
+    if xm.xla_device_hw() == "TPU":
         preferred_device = "tpu"
         num_devices = 8  # Use 8 devices for TPU
+        tpu_available = True
     else:
         preferred_device = "gpu" if torch.cuda.is_available() else "cpu"
         num_devices = 1  # Default to 1 device for GPU or CPU
@@ -154,7 +158,7 @@ def prepare_dataloaders(
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -174,6 +178,10 @@ def prepare_dataloaders(
         worker_init_fn=open_hdf5_file,
         persistent_workers=True
     )
+
+    if tpu_available:
+        train_loader = pl.MpDeviceLoader(train_loader, xm.xla_device())  # type: ignore
+        val_loader = pl.MpDeviceLoader(val_loader, xm.xla_device())  # type: ignore
     
     return train_loader, val_loader
 
@@ -204,6 +212,8 @@ def main():
             num_heads=args.num_heads,
             num_steps=args.num_steps,
             num_layers=args.num_layers,
+            short_term_window=args.prev_short_term_window + args.next_short_term_window + 1,
+            long_term_window=args.prev_long_term_window + args.next_long_term_window + 1,
             lr=args.learning_rate
         )
 

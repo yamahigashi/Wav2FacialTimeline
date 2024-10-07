@@ -97,7 +97,7 @@ class LongTermTemporalModule(nn.Module):
 class PositionalEncoding(nn.Module):
     """Positional Encoding Module"""
 
-    def __init__(self, embed_dim, max_len=MAX_WINDOW_SIZE):
+    def __init__(self, embed_dim, max_len):
         # type: (int, int) -> None
 
         super(PositionalEncoding, self).__init__()
@@ -109,6 +109,24 @@ class PositionalEncoding(nn.Module):
         self.temporal_embeddings = nn.Embedding(3, embed_dim)
 
         self.max_len = max_len
+        
+        # Precompute relative position matrix once (for fixed seq_len)
+        relative_positions = self._precompute_relative_positions(max_len)
+        self.register_buffer("relative_positions", relative_positions)
+       
+        # FIXME: This buffered tensor causes a CUDA RuntimeError:
+        # Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+        # Precompute embeddings for these relative positions
+        # precomputed_relative_embeddings = self.relative_position_embeddings(self.relative_positions)
+        # self.register_buffer("precomputed_relative_embeddings", precomputed_relative_embeddings)
+
+    def _precompute_relative_positions(self, max_len):
+        """Precompute the relative positions matrix for fixed max_len."""
+        positions = torch.arange(max_len, dtype=torch.long)
+        relative_positions = positions.view(-1, 1) - positions.view(1, -1)
+        relative_positions += (max_len - 1)  # Shift to positive values
+
+        return relative_positions
 
     def forward(self, x, current_frame_idx):
         # type: (Float[Array, "seq_len", "batch", "embed_dim"], Int[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
@@ -124,20 +142,14 @@ class PositionalEncoding(nn.Module):
         """
         seq_len, batch_size, embed_dim = x.size()
 
-        assert seq_len <= self.max_len, "Sequence length exceeds maximum length."
+        # 1. Encode relative positions an truncate to the current sequence length
+        relative_position_encodings = self.relative_position_embeddings(self.relative_positions[:seq_len, :seq_len])
+        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)
+        relative_position_encodings = relative_position_encodings.sum(dim=2)
 
-        # 1. Encode relative positions
-        positions = torch.arange(seq_len, dtype=torch.long, device=x.device)
-        relative_positions = positions.view(-1, 1) - positions.view(1, -1)
-        relative_positions += self.max_len - 1  # Shift to positive values for embedding lookup
-        
-        # Get relative position encodings: (seq_len, seq_len, embed_dim)
-        relative_position_encodings = self.relative_position_embeddings(relative_positions)
-        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)  # (seq_len, batch_size, seq_len, embed_dim)
-        
         # 2. Encode temporal positions
         temporal_indices = torch.zeros((seq_len, batch_size), device=x.device, dtype=torch.long)  # initialize temporal indices to 0 (current frame)
-        
+
         # Create a matrix representing the frame indices (seq_len, 1)
         frame_index_matrix = torch.arange(seq_len, device=x.device).unsqueeze(1)  # type: Int[Array, "seq_len", 1]
         
@@ -150,16 +162,12 @@ class PositionalEncoding(nn.Module):
         temporal_indices[past_mask] = 0
         temporal_indices[current_mask] = 1
         temporal_indices[future_mask] = 2
-        
         # Retrieve temporal encodings based on temporal indices (seq_len, batch_size, embed_dim)
         temporal_encoding = self.temporal_embeddings(temporal_indices)  # Temporal embeddings are looked up using batched indices
-        
+
         # 3. Combine relative position encodings and temporal encodings
-        # Sum across all relative position encodings for each batch and sequence index
-        relative_position_sum = relative_position_encodings.sum(dim=2)  # Sum along seq_len dimension: (seq_len, batch_size, embed_dim)
-        
-        # Add temporal encoding and relative position encoding to input x
-        x = x + temporal_encoding + relative_position_sum
+        x = x + temporal_encoding + relative_position_encodings
+
         return x
 
 
@@ -293,8 +301,19 @@ class EmotionConstraintLayer(torch.nn.Module):
 class SpeechToExpressionModel(pl.LightningModule):
     """Temporal Diffusion Speaker Model"""
 
-    def __init__(self, embed_dim, output_dim, num_heads, num_steps, num_layers, num_speakers=1, lr=1e-3):
-        # type: (int, int, int, int, int, int, float) -> None
+    def __init__(
+            self,
+            embed_dim,
+            output_dim,
+            num_heads,
+            num_steps,
+            num_layers,
+            short_term_window,
+            long_term_window,
+            num_speakers=1,
+            lr=1e-3
+    ):
+        # type: (int, int, int, int, int, int, int, int, float) -> None
         """Initialize the SpeechToExpressionModel
 
         Args:
@@ -309,8 +328,8 @@ class SpeechToExpressionModel(pl.LightningModule):
         
         self.short_term_module = ShortTermTemporalModule(embed_dim, num_heads)
         self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
-        self.short_positional_encoding = PositionalEncoding(embed_dim)
-        self.long_positional_encoding = PositionalEncoding(embed_dim)
+        self.short_positional_encoding = PositionalEncoding(embed_dim, short_term_window)
+        self.long_positional_encoding = PositionalEncoding(embed_dim, long_term_window)
         self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_layers, num_speakers)
         self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
         self.emotion_constraint_layer = EmotionConstraintLayer()
@@ -381,7 +400,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         constrained_output = self.emotion_constraint_layer(denoised_output)
 
         final_output = constrained_output [:, -1, :]  # Only return the final frame output
-        # final_output = final_output.permute(1, 0, 2)  # permute back to (batch_size, seq_len, embed_dim)
         
         return final_output
 
