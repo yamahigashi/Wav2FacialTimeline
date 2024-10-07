@@ -15,18 +15,33 @@ from dataset import (
 )
 from model import SpeechToExpressionModel
 
+try:
+    import torch_xla.core.xla_model as xm
+    if xm.xla_device_hw() == 'TPU':
+        preferred_device = "tpu"
+        num_devices = 8  # Use 8 devices for TPU
+    else:
+        preferred_device = "gpu" if torch.cuda.is_available() else "cpu"
+        num_devices = 1  # Default to 1 device for GPU or CPU
+except ImportError:
+    # Fallback to GPU or CPU if TPU is not available
+    preferred_device = "gpu" if torch.cuda.is_available() else "cpu"
+    num_devices = 1  # Default to 1 device
+
+
 import typing
 if typing.TYPE_CHECKING:
     from dataset import (
         Batch,  # noqa: F401
         BatchData,  # noqa: F401
     )
-
+##################################################################################################
 
 WAV2VEC2_EMBED_DIM = 768
 FACIAL_FEATURE_DIM = 31
 
 
+##################################################################################################
 def parse_args():
     # type: () -> argparse.Namespace
     """Parse command line arguments."""
@@ -210,8 +225,14 @@ def main():
     # Initialize the PyTorch Lightning trainer
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        accelerator=preferred_device,
+        devices=num_devices,
         logger=logger,
+        # TPUs may require you to adjust your batch size for efficient usage.
+        # If you're running into memory issues, you can use gradient accumulation
+        # to simulate larger batch sizes: Add the accumulate_grad_batches option
+        # to your trainer to control how many batches are accumulated before performing a backward pass:
+        # accumulate_grad_batches=4,  # Accumulate gradients over 4 batches
         callbacks=[checkpoint_callback, early_stopping_callback]
     )
 
