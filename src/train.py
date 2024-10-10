@@ -8,12 +8,13 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
+import optuna
 
 from dataset import (
     SpeakerDataset,
     open_hdf5_file,
 )
-from model import SpeechToExpressionModel
+from model import SpeechToExpressionModel, HyperParameters
 
         
 tpu_available = False
@@ -63,11 +64,96 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for optimizer.")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs for training.")
-    parser.add_argument("--num_steps", type=int, default=10, help="Number of diffusion steps.")
-    parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads.")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of Transformer layers.")
+    parser.add_argument("--stm_heads", type=int, default=1, help="Number of attention heads.")
+    parser.add_argument("--ltm_heads", type=int, default=24, help="Number of attention heads.")
+    parser.add_argument("--ltm_layers", type=int, default=8, help="Number of Transformer layers.")
+    parser.add_argument("--attn_heads", type=int, default=32, help="Number of attention heads.")
+    parser.add_argument("--attn_bias_factor", type=float, default=0.33, help="Number of attention heads.")
+    parser.add_argument("--attn_layers", type=int, default=2, help="Number of Transformer layers.")
+    parser.add_argument("--diff_steps", type=int, default=1024, help="Number of diffusion steps.")
+
+    parser.add_argument("--tune", action="store_true", help="Tune hyperparameters using Optuna.", default=False)
     
     return parser.parse_args()
+
+
+##################################################################################################
+def objective(trial):
+    # type: (optuna.Trial) -> float
+    """Objective function for Optuna to optimize hyperparameters."""
+
+    divisible_by_768 = [i for i in range(1, 33) if 768 % i == 0]
+
+    # Suggest hyperparameters to tune
+    hparams = HyperParameters(
+        embed_dim = WAV2VEC2_EMBED_DIM,
+        output_dim = FACIAL_FEATURE_DIM,
+        lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
+
+        # ShortTermTemporalModule
+        stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
+
+        # LongTermTemporalModule
+        ltm_heads = trial.suggest_categorical("ltm_heads", divisible_by_768),
+        ltm_layers = trial.suggest_int("ltm_layers", 1, 16),
+
+        # BiasedConditionalSelfAttention
+        attn_heads = trial.suggest_categorical("attn_heads", divisible_by_768),
+        attn_layers = trial.suggest_int("attn_layers", 1, 16),
+        attn_bias_factor = trial.suggest_float("attn_bias_factor", 0.0, 0.5),
+
+        # DiffusionModel
+        diff_steps = trial.suggest_int("diff_steps", 1, 4096),
+        diff_beta_start = 0.0001,
+        diff_beta_end = 0.02,
+    )
+    
+    # Pass the suggested hyperparameters into your model
+    model = SpeechToExpressionModel(
+        hparams,
+        short_term_window=4 + 3 + 1,
+        long_term_window=90 + 60 + 1,
+    )
+
+    # Create PyTorch Lightning trainer
+    trainer = pl.Trainer(
+        max_epochs=10,
+        logger=TensorBoardLogger("logs/"),
+        callbacks=[EarlyStopping(monitor="val_loss")],
+
+        accelerator=preferred_device,
+        devices=num_devices,
+    )
+
+    # Create DataLoaders with the suggested batch size
+    args = parse_args()
+    train_loader, val_loader = prepare_dataloaders(
+        args.hdf5_file,
+        args.prev_short_term_window,
+        args.next_short_term_window,
+        args.prev_long_term_window, 
+        args.next_long_term_window, 
+        trial.suggest_int("batch_size", 1, 32)
+    )
+    trainer.fit(model, train_loader, val_loader)
+
+    # Return the validation loss (or accuracy, depending on your goal)
+    return trainer.callback_metrics["val_loss"].item()
+
+
+def show_best_parameters(study):
+    # type: (optuna.Study) -> None
+    """Show the best hyperparameters found by Optuna."""
+    print("Number of finished trials: ", len(study.trials))
+    print("Best trial:")
+    trial = study.best_trial
+    print("  Value: ", trial.value)
+    print("  Params: ")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+
+
+##################################################################################################
 
 
 def collate_fn(batch):
@@ -193,6 +279,17 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    if args.tune:
+        # Optimize hyperparameters using Optuna
+        study = optuna.create_study(
+            direction="minimize",
+            storage="sqlite:///optuna.db",
+            study_name="speech_to_expression"
+        )
+        study.optimize(objective, n_trials=10)
+        show_best_parameters(study)
+        return
+
     # Prepare the dataset and dataloaders
     train_loader, val_loader = prepare_dataloaders(
         args.hdf5_file,
@@ -200,7 +297,31 @@ def main():
         args.next_short_term_window,
         args.prev_long_term_window, 
         args.next_long_term_window, 
-        args.batch_size
+        args.batch_size,
+        device=preferred_device
+    )
+
+    hparams = HyperParameters(
+        embed_dim = WAV2VEC2_EMBED_DIM,
+        output_dim = FACIAL_FEATURE_DIM,
+        lr = 1e-3,
+
+        # ShortTermTemporalModule
+        stm_heads = args.stm_heads,
+
+        # LongTermTemporalModule
+        ltm_heads = args.ltm_heads,
+        ltm_layers = args.ltm_layers,
+
+        # BiasedConditionalSelfAttention
+        attn_heads = args.attn_heads,
+        attn_layers = args.attn_layers,
+        attn_bias_factor = args.attn_bias_factor,
+
+        # DiffusionModel
+        diff_steps = args.diff_steps,
+        diff_beta_start = 0.0001,
+        diff_beta_end = 0.02,
     )
 
     if args.resume_checkpoint:
