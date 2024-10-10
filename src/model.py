@@ -30,6 +30,11 @@ class HyperParameters:
     output_dim: int = 31
     lr: float = 1e-3
 
+    stm_prev_window: int = 4
+    stm_next_window: int = 3
+    ltm_prev_window: int = 90
+    ltm_next_window: int = 60
+
     # ShortTermTemporalModule
     stm_heads: int = 8
 
@@ -314,7 +319,7 @@ class EmotionConstraintLayer(torch.nn.Module):
     def forward(self, x):
         # type: (Float[Array, "batch", "seq_len", "embed_dim"]) -> Float[Array, "batch", "seq_len", "embed_dim"]
 
-        # カラム21から27にソフトマックスを適用して和が1になるようにする
+        # col21から27 (facial expressions) の値をsoftmaxで正規化
         emotion_outputs = x[:, 21:28]
         emotion_outputs = torch.nn.functional.softmax(emotion_outputs, dim=1)
 
@@ -327,8 +332,8 @@ class EmotionConstraintLayer(torch.nn.Module):
 class SpeechToExpressionModel(pl.LightningModule):
     """Temporal Diffusion Speaker Model"""
 
-    def __init__(self, hparams, short_term_window, long_term_window):
-        # type: (HyperParameters, int, int) -> None
+    def __init__(self, hparams):
+        # type: (HyperParameters) -> None
         """Initialize the SpeechToExpressionModel
 
         Args:
@@ -339,6 +344,9 @@ class SpeechToExpressionModel(pl.LightningModule):
             lr (float): The learning rate for training the model
         """
         super(SpeechToExpressionModel, self).__init__()
+
+        short_term_window = hparams.stm_prev_window + hparams.stm_next_window + 1
+        long_term_window = hparams.ltm_prev_window + hparams.ltm_next_window + 1
         
         self.short_term_module = ShortTermTemporalModule(hparams.embed_dim, hparams.stm_heads)
         self.long_term_module = LongTermTemporalModule(hparams.embed_dim, hparams.ltm_heads, hparams.ltm_layers)
