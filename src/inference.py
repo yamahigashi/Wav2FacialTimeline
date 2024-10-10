@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the model checkpoint")
     parser.add_argument("--input_file", type=str, required=True, help="Path to the input audio file")
     parser.add_argument("--output_file", type=str, required=False, help="Path to save the output")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
 
     return parser.parse_args()
 
@@ -35,14 +36,12 @@ def load_model(checkpoint_path, device):
     model = SpeechToExpressionModel(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval().to(device)
-    return model
+    return model, hparams
 
 
-def preprocess_inference_data(audio_path, batch_size=1):
-    # type: (str, int) -> Generator
+def preprocess_inference_data(audio_path, hparams, batch_size):
+    # type: (str, dict, int) -> Generator
     """Preprocess input data for inference with batching."""
-    SHORT_TERM_WINDOW = 5
-    LONG_TERM_WINDOW = 100
 
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
     wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
@@ -55,49 +54,119 @@ def preprocess_inference_data(audio_path, batch_size=1):
 
     num_frames = audio_features.shape[0]
 
-    short_term_batch, long_term_batch = [], []
+    s_term_batch = []
+    l_term_batch = []
+    s_mask_batch = []
+    l_mask_batch = []
+    s_frame_batch = []
+    l_frame_batch = []
+
+    def clear_batch(stb, ltb, smb, lmb, sfb, lfb):
+        stb.clear()
+        ltb.clear()
+        smb.clear()
+        lmb.clear()
+        sfb.clear()
+        lfb.clear()
 
     for i in range(num_frames):
-        if i < SHORT_TERM_WINDOW:
-            short_term_features = audio_features[:i + 1]  # Padding for first frames
-        else:
-            short_term_features = audio_features[i - SHORT_TERM_WINDOW:i]
 
-        long_term_start = max(0, i - LONG_TERM_WINDOW)
-        long_term_frames = audio_features[long_term_start:i]
+        (
+            s_term_features,
+            l_term_frames,
+            s_frame_masks,
+            l_frame_masks,
+            current_s_frame,
+            current_l_frame
 
-        if len(long_term_frames) == 0:
-            long_term_frames = np.zeros((1, audio_features.shape[1]))
+        ) = get_audio_feature_parameters(audio_features, i, hparams)
 
-        short_term_batch.append(torch.tensor(short_term_features, dtype=torch.float32))
-        long_term_batch.append(torch.tensor(long_term_frames, dtype=torch.float32))
+        # print(f"get frame {i:04d}/{num_frames:4d} ({current_s_frame}) {s_frame_masks}")
+        # print(f"get frame {i:04d}/{num_frames:4d} ({current_l_frame}) {l_frame_masks.shape}")
 
-        if len(short_term_batch) == batch_size:
+        s_term_batch.append(s_term_features)
+        l_term_batch.append(l_term_frames)
+        s_mask_batch.append(s_frame_masks)
+        l_mask_batch.append(l_frame_masks)
+        s_frame_batch.append(current_s_frame)
+        l_frame_batch.append(current_l_frame)
+
+        if len(s_term_batch) % batch_size == 0:
             # Pad sequences to the same length
-            padded_short_term_batch = pad_sequence(short_term_batch, batch_first=True)
-            padded_long_term_batch = pad_sequence(long_term_batch, batch_first=True)
+            padded_s_term_batch = pad_sequence(s_term_batch, batch_first=True)
+            padded_l_term_batch = pad_sequence(l_term_batch, batch_first=True)
+            padded_s_mask_batch = pad_sequence(s_mask_batch, batch_first=True)
+            padded_l_mask_batch = pad_sequence(l_mask_batch, batch_first=True)
+            s_frame = torch.stack(s_frame_batch)
+            l_frame = torch.stack(l_frame_batch)
 
-            yield padded_short_term_batch, padded_long_term_batch
+            yield padded_s_term_batch, padded_l_term_batch, padded_s_mask_batch, padded_l_mask_batch, s_frame, l_frame
 
             # Reset batch lists
-            short_term_batch, long_term_batch = [], []
+            clear_batch(s_term_batch, l_term_batch, s_mask_batch, l_mask_batch, s_frame_batch, l_frame_batch)
 
     # Yield any remaining data that didn't fill a complete batch
-    if short_term_batch:
-        padded_short_term_batch = pad_sequence(short_term_batch, batch_first=True)
-        padded_long_term_batch = pad_sequence(long_term_batch, batch_first=True)
-        yield padded_short_term_batch, padded_long_term_batch
+    if s_term_batch:
+        padded_s_term_batch = pad_sequence(s_term_batch, batch_first=True)
+        padded_l_term_batch = pad_sequence(l_term_batch, batch_first=True)
+        padded_s_mask_batch = pad_sequence(s_mask_batch, batch_first=True)
+        padded_l_mask_batch = pad_sequence(l_mask_batch, batch_first=True)
+
+        s_frame = torch.stack(s_frame_batch)
+        l_frame = torch.stack(l_frame_batch)
+
+        yield padded_s_term_batch, padded_l_term_batch, padded_s_mask_batch, padded_l_mask_batch, s_frame, l_frame
 
 
-def run_inference(model, frame_features, global_frame_features, device):
-    # type: (torch.nn.Module, torch.Tensor, torch.Tensor, torch.device) -> torch.Tensor
+def get_audio_feature_parameters(audio_features, frame, hparams):
+    # type: (torch.Tensor, int, dict) -> ...
+
+    pst_window = hparams.get("prev_short_term_window", 4)
+    nst_window = hparams.get("next_short_term_window", 3)
+    plt_window = hparams.get("prev_long_term_window", 90)
+    nlt_window = hparams.get("next_long_term_window", 60)
+    embed_dim = hparams.get("embed_dim", 768)
+
+    return utils.prepare_audio_features_and_masks(
+        audio_features,
+        frame,
+        pst_window,
+        nst_window,
+        plt_window,
+        nlt_window,
+        embed_dim,
+    )
+
+
+def run_inference(
+        model,
+        frame_features,
+        global_frame_features,
+        frame_masks,
+        global_frame_masks,
+        current_short_frame,
+        current_long_frame,
+        device,
+        hparams
+):
     """Run inference on the given data."""
 
     frame_features = frame_features.to(device)
     global_frame_features = global_frame_features.to(device)
+    frame_masks = frame_masks.to(device)
+    global_frame_masks = global_frame_masks.to(device)
+    current_short_frame = current_short_frame.to(device)
+    current_long_frame = current_long_frame.to(device)
 
     with torch.no_grad():
-        output = model(frame_features, global_frame_features)
+        output = model(
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame
+        )
     return output
 
 
@@ -163,17 +232,42 @@ def save_output_to_csv(results, output_file_path):
 def main():
 
     args = parse_args()
+    batch_size = args.batch_size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results = []
-    model = load_model(args.checkpoint, device)
+    model, hparams = load_model(args.checkpoint, device)
 
-    data_gen = preprocess_inference_data(args.input_file)
+    data_gen = preprocess_inference_data(args.input_file, hparams, batch_size)
 
-    for frame_features, global_frame_features in tqdm(data_gen, desc="Processing frames"):
-        output = run_inference(model, frame_features, global_frame_features, device)
+    for batch in tqdm(data_gen, desc="Processing frames"):
+        (
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame
+        )= batch
 
-        results.append(output.cpu())
+        output = run_inference(
+            model,
+            frame_features,
+            global_frame_features,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
+            device,
+            hparams
+        )
+
+        for batch_output in range(batch_size):
+            try:
+                res = output[batch_output].cpu()
+                results.append(res)
+            except IndexError:
+                break
 
     # Save or process the output
     if args.output_file:

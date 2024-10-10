@@ -1,3 +1,5 @@
+import dataclasses
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +22,32 @@ if typing.TYPE_CHECKING:
 MAX_WINDOW_SIZE = 600
 
 
+@dataclasses.dataclass
+class HyperParameters:
+    """Hyperparameters for the SpeechToExpressionModel"""
+
+    embed_dim: int = 768
+    output_dim: int = 31
+    lr: float = 1e-3
+
+    # ShortTermTemporalModule
+    stm_heads: int = 8
+
+    # LongTermTemporalModule
+    ltm_heads: int = 8
+    ltm_layers: int = 8
+
+    # BiasedConditionalSelfAttention
+    attn_heads: int = 8
+    attn_layers: int = 8  
+    attn_bias_factor: float = 0.1
+
+    # DiffusionModel
+    diff_steps: int = 100  # DiffusionModel steps
+    diff_beta_start: float = 0.0001
+    diff_beta_end: float = 0.02
+
+
 class ShortTermTemporalModule(nn.Module):
     """Short-term Temporal Module"""
 
@@ -32,7 +60,7 @@ class ShortTermTemporalModule(nn.Module):
             num_heads (int): The number of heads in the multi-head attention
         """
         super(ShortTermTemporalModule, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads * 3)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, frame_features, key_padding_mask):
@@ -103,7 +131,7 @@ class PositionalEncoding(nn.Module):
         super(PositionalEncoding, self).__init__()
 
         # Embeddings layer for relative positional encoding
-        self.relative_position_embeddings = nn.Embedding(2 * max_len - 1, embed_dim)
+        self.relative_position_embeddings = nn.Embedding(2 * max_len + 1, embed_dim)
 
         # Embeddings layer for temporal encoding, 3 values: past, present, future
         self.temporal_embeddings = nn.Embedding(3, embed_dim)
@@ -146,6 +174,13 @@ class PositionalEncoding(nn.Module):
         relative_position_encodings = self.relative_position_embeddings(self.relative_positions[:seq_len, :seq_len])
         relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)
         relative_position_encodings = relative_position_encodings.sum(dim=2)
+        if seq_len > self.max_len:
+            # expand the relative position encodings to the current sequence length
+            relative_position_encodings = nn.functional.pad(
+                relative_position_encodings,
+                (0, 0, seq_len - self.max_len, 0),
+                mode="constant",
+            )
 
         # 2. Encode temporal positions
         temporal_indices = torch.zeros((seq_len, batch_size), device=x.device, dtype=torch.long)  # initialize temporal indices to 0 (current frame)
@@ -174,7 +209,7 @@ class PositionalEncoding(nn.Module):
 class BiasedConditionalSelfAttention(nn.Module):
     """Biased Conditional Self-Attention with Transformer"""
 
-    def __init__(self, embed_dim, num_heads, num_layers, num_speakers=None, bias_factor=0.1):
+    def __init__(self, embed_dim, num_heads, num_layers, bias_factor=0.1):
         super(BiasedConditionalSelfAttention, self).__init__()
         self.bias_factor = bias_factor
 
@@ -182,11 +217,6 @@ class BiasedConditionalSelfAttention(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
-
-        if num_speakers is not None:
-            self.speaker_embeddings = nn.Embedding(num_speakers, embed_dim)
-        else:
-            self.speaker_embeddings = None
 
     def forward(self, input_features, speaker_info=None):
         # input_features: (seq_len, batch_size, embed_dim)
@@ -196,11 +226,7 @@ class BiasedConditionalSelfAttention(nn.Module):
 
         # スピーカーバイアスの適用
         if speaker_info is not None:
-            if self.speaker_embeddings is not None and speaker_info.dim() == 1:
-                speaker_embed = self.speaker_embeddings(speaker_info).unsqueeze(0)  # (1, batch_size, embed_dim)
-            else:
-                speaker_embed = speaker_info.unsqueeze(0)  # (1, batch_size, embed_dim)
-
+            speaker_embed = speaker_info.unsqueeze(0)  # (1, batch_size, embed_dim)
             bias = speaker_embed * self.bias_factor
             attn_output = attn_output + bias  # seq_len方向にブロードキャスト
 
@@ -251,11 +277,11 @@ class DiffusionModel(nn.Module):
 
         return predicted_noise, noise
 
-    def sample(self, num_samples, device):
-        # type: (int, torch.device) -> Float[Array, "batch", "seq_len", "embed_dim"]
+    def sample(self, x, num_samples, device):
+        # type: (torch.Tensor, int, torch.device) -> Float[Array, "batch", "seq_len", "embed_dim"]
         """Generate samples using the reverse diffusion process."""
 
-        x = torch.randn(num_samples, self.output_dim, device=device)
+        # x = torch.randn(num_samples, self.output_dim, device=device)
         for t in reversed(range(self.num_steps)):
 
             t_tensor = torch.full((num_samples,), t, device=device, dtype=torch.long)
@@ -301,19 +327,8 @@ class EmotionConstraintLayer(torch.nn.Module):
 class SpeechToExpressionModel(pl.LightningModule):
     """Temporal Diffusion Speaker Model"""
 
-    def __init__(
-            self,
-            embed_dim,
-            output_dim,
-            num_heads,
-            num_steps,
-            num_layers,
-            short_term_window,
-            long_term_window,
-            num_speakers=1,
-            lr=1e-3
-    ):
-        # type: (int, int, int, int, int, int, int, int, float) -> None
+    def __init__(self, hparams, short_term_window, long_term_window):
+        # type: (HyperParameters, int, int) -> None
         """Initialize the SpeechToExpressionModel
 
         Args:
@@ -321,20 +336,19 @@ class SpeechToExpressionModel(pl.LightningModule):
             num_heads (int): The number of heads in the multi-head attention
             num_steps (int): The number of diffusion steps
             num_layers (int): The number of transformer encoder layers
-            num_speakers (int): The number of speakers
             lr (float): The learning rate for training the model
         """
         super(SpeechToExpressionModel, self).__init__()
         
-        self.short_term_module = ShortTermTemporalModule(embed_dim, num_heads)
-        self.long_term_module = LongTermTemporalModule(embed_dim, num_heads, num_layers)
-        self.short_positional_encoding = PositionalEncoding(embed_dim, short_term_window)
-        self.long_positional_encoding = PositionalEncoding(embed_dim, long_term_window)
-        self.biased_attention = BiasedConditionalSelfAttention(embed_dim, num_heads, num_layers, num_speakers)
-        self.diffusion = DiffusionModel(embed_dim, output_dim, num_steps)
+        self.short_term_module = ShortTermTemporalModule(hparams.embed_dim, hparams.stm_heads)
+        self.long_term_module = LongTermTemporalModule(hparams.embed_dim, hparams.ltm_heads, hparams.ltm_layers)
+        self.short_positional_encoding = PositionalEncoding(hparams.embed_dim, short_term_window)
+        self.long_positional_encoding = PositionalEncoding(hparams.embed_dim, long_term_window)
+        self.biased_attention = BiasedConditionalSelfAttention(hparams.embed_dim, hparams.attn_heads, hparams.attn_layers)
+        self.diffusion = DiffusionModel(hparams.embed_dim, hparams.output_dim, hparams.diff_steps, hparams.diff_beta_start, hparams.diff_beta_end)
         self.emotion_constraint_layer = EmotionConstraintLayer()
-        self.num_steps = num_steps
-        self.lr = lr
+        self.diff_steps = hparams.diff_steps
+        self.lr = hparams.lr
         self.emotion_constraint_penalty = 0.001
 
         self.memory_weights = nn.Parameter(torch.ones(2))
@@ -349,9 +363,10 @@ class SpeechToExpressionModel(pl.LightningModule):
             global_frame_masks,
             current_short_frame,
             current_long_frame,
-            speaker_labels=None
+            speaker_labels=None,
+            inference=False
     ):
-        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor|None) -> torch.Tensor
+        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor|None, bool) -> torch.Tensor
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -393,15 +408,30 @@ class SpeechToExpressionModel(pl.LightningModule):
         # Permute the output features back to the original shape
         attention_output = attention_output.permute(1, 0, 2)  # type: Float[Array, "batch_size", seq_len, embed_dim]
 
-        # Generate random timesteps for diffusion
-        batch_size = attention_output.shape[0]
-        t = torch.randint(0, self.num_steps, (batch_size,), device=attention_output.device)
-        denoised_output, _ = self.diffusion(attention_output, t)
-        constrained_output = self.emotion_constraint_layer(denoised_output)
+        if inference:
+            # Perform reverse diffusion sampling during inference
+            num_samples = frame_features.shape[1]  # batch_size
+            device = frame_features.device
+            # Prepare the conditioning information
+            condition = attention_output.permute(1, 0, 2)  # Shape: (batch_size, seq_len, embed_dim)
+            # Use the diffusion model's sampling method
+            generated_output = self.diffusion.sample(
+                condition,
+                num_samples=num_samples,
+                # condition=condition,
+                device=device
+            )
+            final_output = self.emotion_constraint_layer(generated_output)
+            return final_output
 
-        final_output = constrained_output [:, -1, :]  # Only return the final frame output
-        
-        return final_output
+        else:
+            # Training mode (existing code)
+            batch_size = attention_output.shape[0]
+            t = torch.randint(0, self.diffusion.num_steps, (batch_size,), device=attention_output.device)
+            denoised_output, _ = self.diffusion(attention_output, t)
+            constrained_output = self.emotion_constraint_layer(denoised_output)
+            final_output = constrained_output[:, -1, :]  # Only return the final frame output
+            return final_output
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor

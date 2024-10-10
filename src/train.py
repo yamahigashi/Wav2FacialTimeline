@@ -137,11 +137,13 @@ def prepare_dataloaders(
         next_short_term_window,
         prev_long_term_window,
         next_long_term_window,
-        batch_size
+        batch_size,
+        device
 ):
-    # type: (str, int, int, int, int, int) -> tuple[DataLoader, DataLoader]
+    # type: (str, int, int, int, int, int, torch.device) -> tuple[DataLoader, DataLoader]
     """Prepares DataLoader for training and validation."""
 
+    dev = torch.device("cpu") if device == "cpu" else torch.device("cuda:0")
     # Initialize dataset and dataloader
     dataset = SpeakerDataset(
         hdf5_file=hdf5_file, 
@@ -149,7 +151,8 @@ def prepare_dataloaders(
         prev_short_term_window=prev_short_term_window, 
         next_short_term_window=next_short_term_window, 
         prev_long_term_window=prev_long_term_window,
-        next_long_term_window=next_long_term_window
+        next_long_term_window=next_long_term_window,
+        device=dev
     )
 
     num_workers = multiprocessing.cpu_count() // 2
@@ -207,14 +210,9 @@ def main():
     else:
         # Initialize the model
         model = SpeechToExpressionModel(
-            embed_dim=WAV2VEC2_EMBED_DIM,
-            output_dim=FACIAL_FEATURE_DIM,
-            num_heads=args.num_heads,
-            num_steps=args.num_steps,
-            num_layers=args.num_layers,
+            hparams,
             short_term_window=args.prev_short_term_window + args.next_short_term_window + 1,
             long_term_window=args.prev_long_term_window + args.next_long_term_window + 1,
-            lr=args.learning_rate
         )
 
     # Set up logging using TensorBoard

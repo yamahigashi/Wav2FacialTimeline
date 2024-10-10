@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
+import utils
+
 import typing
 if typing.TYPE_CHECKING:
     Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
@@ -24,6 +26,7 @@ class SpeakerDataset(Dataset):
             next_short_term_window=3,
             prev_long_term_window=90,
             next_long_term_window=60,
+            device=None
     ):
         """Initialize the dataset by reading from the HDF5 file.
 
@@ -41,6 +44,7 @@ class SpeakerDataset(Dataset):
         self.next_short_term_window = next_short_term_window
         self.prev_long_term_window = prev_long_term_window
         self.next_long_term_window = next_long_term_window
+        self.device = device
 
         # Open HDF5 file and retrieve all file names (keys) stored in the dataset
         self.hdf5_file = h5py.File(hdf5_file, "r")
@@ -90,47 +94,30 @@ class SpeakerDataset(Dataset):
             raise RuntimeError("HDF5 file is not opened. Ensure `worker_init_fn` is used to open the file in each worker.")
 
         file_key, file_frame_idx = self._get_file_index(idx)
-        # Load the specific file's facial expression and audio feature datasets
         facial_expressions = self.hdf5_file[f"{file_key}/facial_expression"][:]
         audio_features = self.hdf5_file[f"{file_key}/audio_feature"][:]
 
-        # Define the range for short-term memory (past and future)
-        short_term_start = max(0, file_frame_idx - self.prev_short_term_window)  # Past frames
-        short_term_end = min(len(audio_features), file_frame_idx + self.next_short_term_window + 1)  # Future frames
+        (
+            short_term_features,
+            long_term_features,
+            short_frame_mask,
+            long_frame_mask,
+            current_short_frame,
+            current_long_frame
 
-        # Define the range for long-term memory (past and future)
-        long_term_start = max(0, file_frame_idx - self.prev_long_term_window)  # Past frames
-        long_term_end = min(len(audio_features), file_frame_idx + self.next_long_term_window + 1)  # Future frames
+        ) = utils.prepare_audio_features_and_masks(
+            audio_features,
+            file_frame_idx,
+            self.prev_short_term_window,
+            self.next_short_term_window,
+            self.prev_long_term_window,
+            self.next_long_term_window,
+            self.embed_dim,
+            device=self.device
+        )
+        # print(f"get frame {file_frame_idx:04d}/{audio_length} ({current_short_frame}) {short_frame_mask}")
 
-        # Get the short-term and long-term features
-        short_term_features = audio_features[short_term_start:short_term_end]
-        long_term_frames = audio_features[long_term_start:long_term_end]
-
-        # Convert to tensors
-        short_term_features = torch.tensor(short_term_features, dtype=torch.float32)
-        long_term_features = torch.tensor(long_term_frames, dtype=torch.float32)
         labels = torch.tensor(facial_expressions[file_frame_idx], dtype=torch.float32)  # Label for the current frame
-
-        # Create masks based on whether the frame is near the start or end of the sequence
-        short_frame_mask = torch.ones(self.prev_short_term_window, dtype=torch.bool)
-        if file_frame_idx < self.prev_short_term_window:
-            short_frame_mask[:self.prev_short_term_window - file_frame_idx] = 0  # Mask the beginning
-     
-        if file_frame_idx + self.next_short_term_window + 1 > len(audio_features):
-            short_frame_mask[self.next_short_term_window + (len(audio_features) - file_frame_idx):] = 0  # Mask the end
-     
-        long_frame_mask = torch.ones(self.prev_long_term_window, dtype=torch.bool)
-        if file_frame_idx < self.prev_long_term_window:
-            long_frame_mask[:self.prev_long_term_window - file_frame_idx] = 0  # Mask the beginning
-     
-        if file_frame_idx + self.next_long_term_window + 1 > len(audio_features):
-            long_frame_mask[self.next_long_term_window + (len(audio_features) - file_frame_idx):] = 0  # Mask the end
-
-        if long_term_features.shape[0] == 0:
-            long_term_features = torch.zeros(1, self.embed_dim)
-
-        current_short_frame = max(0, file_frame_idx - short_term_start)
-        current_long_frame = max(0, file_frame_idx - long_term_start)
 
         return short_term_features, long_term_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame, labels
 
