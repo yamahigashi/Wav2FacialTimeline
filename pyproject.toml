@@ -8,6 +8,7 @@ dependencies = [
   "pip",
   "imageio",
   "jaxtyping",
+  "tensorboard",
   "tensorboardX",
   "llvmlite==0.43",
   "scikit-learn==1.2.2",
@@ -22,4 +23,5 @@ dependencies = [
   "transformers",
   "diffusers",
   "h5py",
+  "optuna",
 ]
