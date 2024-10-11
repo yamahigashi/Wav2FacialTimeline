@@ -1,6 +1,5 @@
 import os
 import tempfile
-import pathlib
 
 import cv2
 import librosa
@@ -10,8 +9,10 @@ import h5py
 import pandas as pd
 import numpy as np
 
-from feat import Detector
-from transformers import Wav2Vec2Processor, Wav2Vec2Model
+import typing
+if typing.TYPE_CHECKING:
+    from feat import Detector
+    from transformers import Wav2Vec2Processor, Wav2Vec2Model
 
 
 def extract_facial_expression(file, feat_detector):
