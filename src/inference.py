@@ -32,7 +32,7 @@ def parse_args():
 def load_model(checkpoint_path, device):
     """Load the pre-trained model from a checkpoint and move it to the specified device."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    hparams = checkpoint["hyper_parameters"]
+    hparams = checkpoint["hyper_parameters"].copy()
     model = SpeechToExpressionModel(**hparams)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval().to(device)
@@ -81,9 +81,6 @@ def preprocess_inference_data(audio_path, hparams, batch_size):
 
         ) = get_audio_feature_parameters(audio_features, i, hparams)
 
-        # print(f"get frame {i:04d}/{num_frames:4d} ({current_s_frame}) {s_frame_masks}")
-        # print(f"get frame {i:04d}/{num_frames:4d} ({current_l_frame}) {l_frame_masks.shape}")
-
         s_term_batch.append(s_term_features)
         l_term_batch.append(l_term_frames)
         s_mask_batch.append(s_frame_masks)
@@ -121,11 +118,12 @@ def preprocess_inference_data(audio_path, hparams, batch_size):
 def get_audio_feature_parameters(audio_features, frame, hparams):
     # type: (torch.Tensor, int, dict) -> ...
 
-    pst_window = hparams.get("prev_short_term_window", 4)
-    nst_window = hparams.get("next_short_term_window", 3)
-    plt_window = hparams.get("prev_long_term_window", 90)
-    nlt_window = hparams.get("next_long_term_window", 60)
-    embed_dim = hparams.get("embed_dim", 768)
+    _hparams = hparams.get("hparams")  # type: HParameters
+    pst_window = _hparams.stm_prev_window
+    nst_window = _hparams.stm_next_window
+    plt_window = _hparams.ltm_prev_window
+    nlt_window = _hparams.ltm_next_window
+    embed_dim = _hparams.embed_dim
 
     return utils.prepare_audio_features_and_masks(
         audio_features,
@@ -165,7 +163,8 @@ def run_inference(
             frame_masks,
             global_frame_masks,
             current_short_frame,
-            current_long_frame
+            current_long_frame,
+            inference=True
         )
     return output
 

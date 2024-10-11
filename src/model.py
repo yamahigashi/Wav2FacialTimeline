@@ -354,10 +354,10 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.long_positional_encoding = PositionalEncoding(hparams.embed_dim, long_term_window)
         self.biased_attention = BiasedConditionalSelfAttention(hparams.embed_dim, hparams.attn_heads, hparams.attn_layers)
         self.diffusion = DiffusionModel(hparams.embed_dim, hparams.output_dim, hparams.diff_steps, hparams.diff_beta_start, hparams.diff_beta_end)
-        self.emotion_constraint_layer = EmotionConstraintLayer()
+        # self.emotion_constraint_layer = EmotionConstraintLayer()
+        # self.emotion_constraint_penalty = 0.001
         self.diff_steps = hparams.diff_steps
         self.lr = hparams.lr
-        self.emotion_constraint_penalty = 0.001
 
         self.memory_weights = nn.Parameter(torch.ones(2))
 
@@ -429,16 +429,16 @@ class SpeechToExpressionModel(pl.LightningModule):
                 # condition=condition,
                 device=device
             )
-            final_output = self.emotion_constraint_layer(generated_output)
-            return final_output
+            # final_output = self.emotion_constraint_layer(generated_output)
+            return generated_output
 
         else:
             # Training mode (existing code)
             batch_size = attention_output.shape[0]
             t = torch.randint(0, self.diffusion.num_steps, (batch_size,), device=attention_output.device)
             denoised_output, _ = self.diffusion(attention_output, t)
-            constrained_output = self.emotion_constraint_layer(denoised_output)
-            final_output = constrained_output[:, -1, :]  # Only return the final frame output
+            # constrained_output = self.emotion_constraint_layer(denoised_output)
+            final_output = denoised_output[:, -1, :]  # Only return the final frame output
             return final_output
 
     def training_step(self, batch, batch_idx):
@@ -480,13 +480,13 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         # Introduce the constraint of sum of the emotions should be 1
         # the col 21 to 27 are the emotion columns
-        emotion_sum = torch.sum(outputs[:, 21:28], dim=1)
-        emo_loss = nn.functional.mse_loss(emotion_sum, torch.ones_like(emotion_sum)) * self.emotion_constraint_penalty
+        # emotion_sum = torch.sum(outputs[:, 21:28], dim=1)
+        # emo_loss = nn.functional.mse_loss(emotion_sum, torch.ones_like(emotion_sum)) * self.emotion_constraint_penalty
+        # self.log("train_emo_loss", emo_loss)
 
         weights = torch.softmax(self.memory_weights, dim=0)
 
-        loss += emo_loss
-        self.log("train_emo_loss", emo_loss)
+        # loss += emo_loss
         self.log("train_loss", loss)
         self.log("short_term_weight", weights[0])
         self.log("long_term_weight", weights[1])
