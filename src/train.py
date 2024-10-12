@@ -83,8 +83,8 @@ def objective(trial):
     """Objective function for Optuna to optimize hyperparameters."""
 
     divisible_by_768 = [i for i in range(1, 33) if 768 % i == 0]
-    stm_prev_window = 4
-    stm_next_window = 9
+    stm_prev_window = 3
+    stm_next_window = 6
     ltm_prev_window = 90
     ltm_next_window = 90
 
@@ -93,7 +93,7 @@ def objective(trial):
         embed_dim = WAV2VEC2_EMBED_DIM,
         output_dim = FACIAL_FEATURE_DIM,
         # lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
-        lr = 0.002,
+        lr = 0.00002,
 
         stm_prev_window = stm_prev_window,
         stm_next_window = stm_next_window,
@@ -102,21 +102,29 @@ def objective(trial):
 
         # ShortTermTemporalModule
         # stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
-        stm_heads = 2,
 
         # LongTermTemporalModule
-        ltm_heads = 8,
-        ltm_layers = 6,
+
+        # BiasedConditionalSelfAttention
+
+        # DiffusionModel
+        diff_beta_start = 0.0001,
+        diff_beta_end = 0.02,
+
+        stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
+
+        # LongTermTemporalModule
+        ltm_heads = trial.suggest_categorical("ltm_heads", divisible_by_768),
+        ltm_layers = trial.suggest_int("ltm_layers", 1, 32),
 
         # BiasedConditionalSelfAttention
         attn_heads = trial.suggest_categorical("attn_heads", divisible_by_768),
-        attn_layers = trial.suggest_int("attn_layers", 1, 12),
-        attn_bias_factor = 0.33,
+        attn_layers = trial.suggest_int("attn_layers", 1, 32),
+        attn_bias_factor = trial.suggest_float("attn_bias_factor", 0.0, 1.0),
 
         # DiffusionModel
-        diff_steps = trial.suggest_int("diff_steps", 1, 256),
-        diff_beta_start = 0.0001,
-        diff_beta_end = 0.02,
+        # diff_steps = trial.suggest_int("diff_steps", 1, 4096),
+        diff_steps = 1,
     )
     
     # Pass the suggested hyperparameters into your model
@@ -124,7 +132,7 @@ def objective(trial):
 
     # Create PyTorch Lightning trainer
     trainer = pl.Trainer(
-        max_epochs=3,
+        max_epochs=5,
         logger=TensorBoardLogger("logs/"),
         callbacks=[EarlyStopping(monitor="val_loss")],
 
@@ -140,8 +148,7 @@ def objective(trial):
         stm_next_window,
         ltm_prev_window,
         ltm_next_window,
-        trial.suggest_int("batch_size", 1, 16),
-        device="cpu" if preferred_device == "cpu" else "cuda:0"
+        trial.suggest_int("batch_size", 1, 8),
     )
     trainer.fit(model, train_loader, val_loader)
 
@@ -232,12 +239,10 @@ def prepare_dataloaders(
         prev_long_term_window,
         next_long_term_window,
         batch_size,
-        device
 ):
-    # type: (str, int, int, int, int, int, torch.device) -> tuple[DataLoader, DataLoader]
+    # type: (str, int, int, int, int, int) -> tuple[DataLoader, DataLoader]
     """Prepares DataLoader for training and validation."""
 
-    dev = torch.device("cpu") if device == "cpu" else torch.device("cuda:0")
     # Initialize dataset and dataloader
     dataset = SpeakerDataset(
         hdf5_file=hdf5_file, 
@@ -246,7 +251,6 @@ def prepare_dataloaders(
         next_short_term_window=next_short_term_window, 
         prev_long_term_window=prev_long_term_window,
         next_long_term_window=next_long_term_window,
-        device=dev
     )
 
     num_workers = multiprocessing.cpu_count() // 2
@@ -295,7 +299,7 @@ def main():
             study_name="speech_to_expression",
             load_if_exists=True
         )
-        study.optimize(objective, n_trials=10)
+        study.optimize(objective, n_trials=100)
         show_best_parameters(study)
         return
 
@@ -307,7 +311,6 @@ def main():
         args.prev_long_term_window, 
         args.next_long_term_window, 
         args.batch_size,
-        device=preferred_device
     )
 
     hparams = HyperParameters(
@@ -380,4 +383,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+
+    mp.set_start_method("spawn", force=True)
     main()
