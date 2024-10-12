@@ -124,9 +124,8 @@ def prepare_audio_features_and_masks(
     prev_long_window,
     next_long_window,
     embed_dim,
-    device=None
 ):
-    # type: (torch.Tensor, int, int, int, int, int, int, ...) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    # type: (torch.Tensor, int, int, int, int, int, int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     """
     Prepare audio features and corresponding masks for short-term and long-term windows centered around a specific frame.
 
@@ -180,16 +179,16 @@ def prepare_audio_features_and_masks(
     lt_frames = audio_features[lt_start:lt_end]
 
     # Convert to tensors
-    st_features = torch.tensor(st_features, dtype=torch.float32, device=device)
-    lt_features = torch.tensor(lt_frames, dtype=torch.float32, device=device)
+    st_features = torch.tensor(st_features, dtype=torch.float32)
+    lt_features = torch.tensor(lt_frames, dtype=torch.float32)
 
     # Pad the short-term and long-term features
     st_features = F.pad(st_features, (0, 0, st_prev_pad, st_next_pad))
     lt_features = F.pad(lt_features, (0, 0, lt_prev_pad, lt_next_pad))
 
     # Create masks based on whether the frame is near the start or end of the sequence
-    short_frame_mask = calculate_frame_masks(audio_length, frame, prev_short_window, next_short_window, device)
-    long_frame_mask = calculate_frame_masks(audio_length, frame, prev_long_window, next_long_window, device)
+    short_frame_mask = calculate_frame_masks(audio_length, frame, prev_short_window, next_short_window)
+    long_frame_mask = calculate_frame_masks(audio_length, frame, prev_long_window, next_long_window)
     # 
     # if st_features.shape[0] > audio_length:
     #     st_features = st_features[:audio_length]
@@ -201,25 +200,25 @@ def prepare_audio_features_and_masks(
     # if short_frame_mask.shape[0] > audio_length:
     #     short_frame_mask = short_frame_mask[:audio_length]
 
-    current_short_frame = torch.tensor(max(0, frame - st_start), device=device)
-    current_long_frame = torch.tensor(max(0, frame - lt_start), device=device)
+    current_short_frame = torch.tensor(max(0, frame - st_start))
+    current_long_frame = torch.tensor(max(0, frame - lt_start))
 
     return st_features, lt_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame
 
 
-def calculate_frame_masks(total_length, current_frame, prev_window, next_window, device=None):
-    # type: (int, int, int, int, torch.device|None) -> torch.Tensor
+def calculate_frame_masks(total_length, current_frame, prev_window, next_window):
+    # type: (int, int, int, int) -> torch.Tensor
     """Calculate the frame masks for the given frame index."""
 
-    prev_masks = torch.zeros(prev_window, dtype=torch.bool, device=device)
+    prev_masks = torch.zeros(prev_window, dtype=torch.bool)
     prev_masks[:max(-prev_window, current_frame - prev_window)] = True
 
-    next_masks = torch.zeros(next_window, dtype=torch.bool, device=device)
+    next_masks = torch.zeros(next_window, dtype=torch.bool)
     next_masks[min(next_window, (total_length - current_frame)):] = True
 
     masks = torch.cat((
         prev_masks,
-        torch.zeros(1, dtype=torch.bool, device=device),  # Current frame is always mask False
+        torch.zeros(1, dtype=torch.bool),  # Current frame is always mask False
         next_masks
     ))
 

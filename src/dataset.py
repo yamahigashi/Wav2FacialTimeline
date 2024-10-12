@@ -26,7 +26,6 @@ class SpeakerDataset(Dataset):
             next_short_term_window=3,
             prev_long_term_window=90,
             next_long_term_window=60,
-            device=None
     ):
         """Initialize the dataset by reading from the HDF5 file.
 
@@ -44,7 +43,6 @@ class SpeakerDataset(Dataset):
         self.next_short_term_window = next_short_term_window
         self.prev_long_term_window = prev_long_term_window
         self.next_long_term_window = next_long_term_window
-        self.device = device
 
         # Open HDF5 file and retrieve all file names (keys) stored in the dataset
         self.hdf5_file = h5py.File(hdf5_file, "r")
@@ -113,7 +111,6 @@ class SpeakerDataset(Dataset):
             self.prev_long_term_window,
             self.next_long_term_window,
             self.embed_dim,
-            device=self.device
         )
         # print(f"get frame {file_frame_idx:04d}/{audio_length} ({current_short_frame}) {short_frame_mask}")
 
