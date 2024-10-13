@@ -82,7 +82,7 @@ def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
 
-    divisible_by_768 = [i for i in range(1, 33) if 768 % i == 0]
+    divisible_by_768 = [i for i in range(1, 129) if 768 % i == 0]
     stm_prev_window = 3
     stm_next_window = 6
     ltm_prev_window = 90
@@ -120,11 +120,9 @@ def objective(trial):
         # BiasedConditionalSelfAttention
         attn_heads = trial.suggest_categorical("attn_heads", divisible_by_768),
         attn_layers = trial.suggest_int("attn_layers", 1, 32),
-        attn_bias_factor = trial.suggest_float("attn_bias_factor", 0.0, 1.0),
 
-        # DiffusionModel
-        # diff_steps = trial.suggest_int("diff_steps", 1, 4096),
-        diff_steps = 1,
+        # MultiFrameAttentionAggregator
+        agg_heads = trial.suggest_categorical("agg_heads", divisible_by_768),
     )
     
     # Pass the suggested hyperparameters into your model
@@ -296,7 +294,7 @@ def main():
         study = optuna.create_study(
             direction="minimize",
             storage="sqlite:///optuna.db",
-            study_name="speech_to_expression",
+            study_name="speech_to_expression3",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)

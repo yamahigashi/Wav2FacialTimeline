@@ -30,8 +30,8 @@ class HyperParameters:
     output_dim: int = 31
     lr: float = 1e-3
 
-    stm_prev_window: int = 4
-    stm_next_window: int = 3
+    stm_prev_window: int = 3
+    stm_next_window: int = 6
     ltm_prev_window: int = 90
     ltm_next_window: int = 60
 
@@ -42,10 +42,12 @@ class HyperParameters:
     ltm_heads: int = 8
     ltm_layers: int = 8
 
-    # BiasedConditionalSelfAttention
+    # FeatureAttentionProcessor
     attn_heads: int = 8
-    attn_layers: int = 8  
-    attn_bias_factor: float = 0.1
+    attn_layers: int = 8
+
+    # MultiFrameAttentionAggregator
+    agg_heads: int = 8
 
     # DiffusionModel
     diff_steps: int = 100  # DiffusionModel steps
@@ -211,167 +213,60 @@ class PositionalEncoding(nn.Module):
         return x
 
 
-class BiasedConditionalSelfAttention(nn.Module):
-    """Biased Conditional Self-Attention with Transformer"""
+class FeatureAttentionProcessor(nn.Module):
 
-    def __init__(self, embed_dim, num_heads, num_layers, bias_factor=0.1):
-        super(BiasedConditionalSelfAttention, self).__init__()
-        self.bias_factor = bias_factor
-
-        # Transformerエンコーダーの定義
+    def __init__(self, embed_dim, num_heads, num_layers):
+        super(FeatureAttentionProcessor, self).__init__()
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_features, speaker_info=None):
-        # input_features: (seq_len, batch_size, embed_dim)
+    def forward(self, input_features):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
 
-        # Transformerエンコーダーの適用
         attn_output = self.transformer_encoder(input_features)
-
-        # スピーカーバイアスの適用
-        if speaker_info is not None:
-            speaker_embed = speaker_info.unsqueeze(0)  # (1, batch_size, embed_dim)
-            bias = speaker_embed * self.bias_factor
-            attn_output = attn_output + bias  # seq_len方向にブロードキャスト
-
         output = self.layer_norm(attn_output)
         return output
 
 
-class DiffusionModel(nn.Module):
-    """Diffusion Model"""
+class MultiFrameAttentionAggregator(nn.Module):
 
-    def __init__(self, embed_dim, output_dim, num_steps, beta_start=0.0001, beta_end=0.02):
-        # type: (int, int, int, float, float) -> None
+    def __init__(self, embed_dim, num_heads):
+        # type: (int, int) -> None
 
-        super(DiffusionModel, self).__init__()
-        self.num_steps = num_steps
-        # self.output_dim = output_dim
-        # self.embed_dim = embed_dim
+        super(MultiFrameAttentionAggregator, self).__init__()
 
-        # # Define betas for forward diffusion process (linear schedule)
-        # self.register_buffer("betas", torch.linspace(beta_start, beta_end, num_steps))
-        # 
-        # # Precompute alphas and alpha bars
-        # self.register_buffer("alphas", 1.0 - self.betas)
-        # self.register_buffer("alpha_bars", torch.cumprod(self.alphas, dim=0))
-        # 
-        # # Time embedding layer
-        # self.time_embed = nn.Embedding(num_steps, embed_dim)
-        # # Model to predict noise ε_θ(x_t, t)
-        # self.network = nn.Sequential(
-        #     nn.Linear(embed_dim + self.time_embed.embedding_dim, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, self.output_dim)  # Output dimension matches input dimension
-        # )
-        self.embed_to_output = nn.Linear(embed_dim, output_dim)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x, t):
-        """Forward pass for training.
+    def forward(self, attn_output):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "batch", "embed_dim"]
 
-        Args:
-            x: Clean data sample of shape [batch_size, seq_len, embed_dim]
-            t: Time step tensor of shape [batch_size]
-        """
-        # batch_size, seq_len, embed_dim = x.shape
-        # 
-        # # Add noise to the data
-        # noise = torch.randn_like(x)  # Shape: [batch_size, seq_len, embed_dim]
-        # alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
-        # sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-        # sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
-        # x_noisy = sqrt_alpha_bar_t * x + sqrt_one_minus_alpha_bar_t * noise  # Shape: [batch_size, seq_len, embed_dim]
-        # 
-        # # Get time embeddings
-        # t_emb = self.time_embed(t)  # Shape: [batch_size, time_embed_dim]
-        # t_emb = t_emb.unsqueeze(1).expand(-1, seq_len, -1)  # Shape: [batch_size, seq_len, time_embed_dim]
-        # 
-        # # Combine x_noisy and t_emb
-        # x_input = torch.cat([x_noisy, t_emb], dim=-1)  # Shape: [batch_size, seq_len, embed_dim + time_embed_dim]
-        # x_input = x_input.view(-1, embed_dim + self.time_embed.embedding_dim)  # Flatten for the network
-        # 
-        # # Predict the noise
-        # predicted_noise = self.network(x_input)  # Shape: [batch_size * seq_len, output_dim]
-        # predicted_noise = predicted_noise.view(batch_size, seq_len, self.output_dim)  # Reshape back
+        # attn_output: (seq_len, batch_size, embed_dim)
+        # attn_weights: (batch_size, seq_len, seq_len)
+        attn_output, attn_weights = self.multihead_attn(attn_output, attn_output, attn_output)
+        permuted_output = attn_output.permute(1, 0, 2)  # (batch_size, seq_len, embed_dim)
+        attn_scores = attn_weights.mean(dim=-1)  # (batch_size, seq_len)
+        attn_scores = attn_scores.unsqueeze(-1)  # (batch_size, seq_len, 1)
+        output = (permuted_output * attn_scores).sum(dim=1)  # (batch_size, embed_dim)
 
-        # Convert x from embed_dim to output_dim for consistency
-        y = self.embed_to_output(x)  # Shape: [batch_size, seq_len, output_dim]
-
-        # # Reverse diffusion process: update x
-        # y = (y - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
-        # 
-        # pooled_output = torch.mean(y , dim=1)  # Shape: [batch_size, output_dim]
-        pooled_output = torch.mean(y, dim=1)  # Shape: [batch_size, output_dim]
-
-        return pooled_output
-
-    def sample(self, x, batch_size, seq_len, device):
-        """Generate samples using the reverse diffusion process.
-
-        Args:
-            batch_size : Number of samples to generate
-            seq_len: Sequence length of each sample
-            device: The device to run the sampling on
-        """
-        # Start from pure noise in output_dim space
-        # x = torch.randn(num_samples, seq_len, self.output_dim, device=device)
-
-        # Initialize a noisy sample (start from pure noise)
-        y = self.embed_to_output(x)  # Shape: [batch_size, seq_len, output_dim]
-     
-        # for t in reversed(range(self.num_steps)):
-        #     # Get the time embeddings for the current time step
-        #     t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-        #     t_emb = self.time_embed(t_tensor)  # Shape: [batch_size, time_embed_dim]
-        #     t_emb = t_emb.unsqueeze(1).expand(-1, seq_len, -1)  # Shape: [batch_size, seq_len, time_embed_dim]
-        # 
-        #     # Combine x (noisy data) and t_emb
-        #     x_input = torch.cat([x, t_emb], dim=-1)  # Shape: [batch_size, seq_len, embed_dim + time_embed_dim]
-        #     x_input = x_input.view(-1, self.embed_dim + self.time_embed.embedding_dim)  # Flatten for the network
-        # 
-        #     # Predict the noise at this time step
-        #     predicted_noise = self.network(x_input)  # Shape: [batch_size * seq_len, output_dim]
-        #     predicted_noise = predicted_noise.view(batch_size, seq_len, self.output_dim)  # Reshape back
-        # 
-        #     # Reverse diffusion process: update x
-        #     alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1)
-        #     sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-        #     sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
-        #     y = (y - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
-        # 
-        #     # If not the last step, add noise
-        #     if t > 0:
-        #         noise = torch.randn_like(y)
-        #         beta_t = self.betas[t].view(-1, 1, 1)
-        #         sqrt_beta_t = torch.sqrt(beta_t)
-        #         y = y + sqrt_beta_t * noise  # Add noise back at each step except the last one
-        # Perform mean pooling to get final output of shape [batch_size, output_dim]
-        pooled_output = torch.mean(y, dim=1)  # Shape: [batch_size, output_dim]
-
-        return pooled_output
+        norm_output = self.layer_norm(output)
+        return norm_output
 
 
-class EmotionConstraintLayer(torch.nn.Module):
-    """Emotion Constraint Layer
+class DimensionalityReducer(nn.Module):
 
-    The sumulation of the emotion columns should be 1.
-    """
+    def __init__(self, embed_dim, output_dim):
+        super(DimensionalityReducer, self).__init__()
+        self.projection = nn.Linear(embed_dim, output_dim)
+        self.gelu = nn.GELU()
 
-    def __init__(self):
-        super(EmotionConstraintLayer, self).__init__()
+    def forward(self, aggregated_features):
+        # type: (Float[Array, "batch", "embed_dim"]) -> Float[Array, "batch", "output_dim"]
 
-    def forward(self, x):
-        # type: (Float[Array, "batch", "seq_len", "embed_dim"]) -> Float[Array, "batch", "seq_len", "embed_dim"]
-
-        # col21から27 (facial expressions) の値をsoftmaxで正規化
-        emotion_outputs = x[:, 21:28]
-        emotion_outputs = torch.nn.functional.softmax(emotion_outputs, dim=1)
-
-        # avoid in-place operation
-        x = x.clone()  # type: ignore
-        x[:, 21:28] = emotion_outputs
-        return x
+        output = self.projection(aggregated_features)  # (batch_size, output_dim)
+        output = self.gelu(output)  # 非線形活性化を適用
+        return output
 
 
 class SpeechToExpressionModel(pl.LightningModule):
@@ -397,11 +292,9 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.long_term_module = LongTermTemporalModule(hparams.embed_dim, hparams.ltm_heads, hparams.ltm_layers)
         self.short_positional_encoding = PositionalEncoding(hparams.embed_dim, short_term_window)
         self.long_positional_encoding = PositionalEncoding(hparams.embed_dim, long_term_window)
-        self.biased_attention = BiasedConditionalSelfAttention(hparams.embed_dim, hparams.attn_heads, hparams.attn_layers)
-        self.diffusion = DiffusionModel(hparams.embed_dim, hparams.output_dim, hparams.diff_steps, hparams.diff_beta_start, hparams.diff_beta_end)
-        # self.emotion_constraint_layer = EmotionConstraintLayer()
-        # self.emotion_constraint_penalty = 0.001
-        self.diff_steps = hparams.diff_steps
+        self.attn_processor = FeatureAttentionProcessor(hparams.embed_dim, hparams.attn_heads, hparams.attn_layers)
+        self.aggregator = MultiFrameAttentionAggregator(hparams.embed_dim, hparams.agg_heads)
+        self.reducer = DimensionalityReducer(hparams.embed_dim, hparams.output_dim)
         self.lr = hparams.lr
 
         self.memory_weights = nn.Parameter(torch.ones(2))
@@ -456,36 +349,11 @@ class SpeechToExpressionModel(pl.LightningModule):
         encoded_long_term = self.long_positional_encoding(weighted_long_term, current_long_frame)
         combined_features = torch.cat((encoded_short_term, encoded_long_term), dim=0)
 
-        seq_len = combined_features.shape[0]
+        attention_output = self.attn_processor(combined_features)
+        aggregated_features = self.aggregator(attention_output)
+        final_output = self.reducer(aggregated_features)
 
-        attention_output = self.biased_attention(combined_features, speaker_labels)
-
-        # Permute the output features back to the original shape
-        attention_output = attention_output.permute(1, 0, 2)  # type: Float[Array, "batch_size", seq_len, embed_dim]
-
-        if inference:
-
-            device = frame_features.device
-
-            # Perform reverse diffusion sampling during inference
-            generated_output = self.diffusion.sample(
-                attention_output,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                # condition=condition,
-                device=device
-            )
-            # final_output = self.emotion_constraint_layer(generated_output)
-            return generated_output
-
-        else:
-            # Training mode (existing code)
-            batch_size = attention_output.shape[0]
-            t = torch.randint(0, self.diffusion.num_steps, (batch_size,), device=attention_output.device)
-            denoised_output = self.diffusion(attention_output, t)
-            # constrained_output = self.emotion_constraint_layer(denoised_output)
-            final_output = denoised_output
-            return final_output
+        return final_output
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -523,12 +391,6 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         # Calculate the mean squared error loss
         loss = nn.functional.mse_loss(outputs, labels)
-
-        # Introduce the constraint of sum of the emotions should be 1
-        # the col 21 to 27 are the emotion columns
-        # emotion_sum = torch.sum(outputs[:, 21:28], dim=1)
-        # emo_loss = nn.functional.mse_loss(emotion_sum, torch.ones_like(emotion_sum)) * self.emotion_constraint_penalty
-        # self.log("train_emo_loss", emo_loss)
 
         weights = torch.softmax(self.memory_weights, dim=0)
 
