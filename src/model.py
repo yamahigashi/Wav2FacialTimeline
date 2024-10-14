@@ -28,7 +28,7 @@ class HyperParameters:
 
     embed_dim: int = 768
     output_dim: int = 31
-    lr: float = 1e-3
+    lr: float = 1e-5
 
     stm_prev_window: int = 3
     stm_next_window: int = 6
@@ -36,23 +36,18 @@ class HyperParameters:
     ltm_next_window: int = 60
 
     # ShortTermTemporalModule
-    stm_heads: int = 8
+    stm_heads: int = 32 
 
     # LongTermTemporalModule
-    ltm_heads: int = 8
-    ltm_layers: int = 8
+    ltm_heads: int = 6
+    ltm_layers: int = 4
 
     # FeatureAttentionProcessor
-    attn_heads: int = 8
-    attn_layers: int = 8
+    attn_heads: int = 3
+    attn_layers: int = 4
 
     # MultiFrameAttentionAggregator
-    agg_heads: int = 8
-
-    # DiffusionModel
-    diff_steps: int = 100  # DiffusionModel steps
-    diff_beta_start: float = 0.0001
-    diff_beta_end: float = 0.02
+    agg_heads: int = 24
 
 
 class ShortTermTemporalModule(nn.Module):
@@ -129,7 +124,7 @@ class LongTermTemporalModule(nn.Module):
         return output
 
 
-class PositionalEncoding(nn.Module):
+class PositionalEncoding(pl.LightningModule):
     """Positional Encoding Module"""
 
     def __init__(self, embed_dim, max_len):

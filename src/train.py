@@ -54,23 +54,22 @@ def parse_args():
     
     # Dataset and model arguments
     parser.add_argument("--hdf5_file", type=str, required=True, help="Path to the HDF5 file.")
-    parser.add_argument("--prev_short_term_window", type=int, default=4, help="Number of short-term frames.")
-    parser.add_argument("--next_short_term_window", type=int, default=3, help="Number of short-term frames.")
+    parser.add_argument("--prev_short_term_window", type=int, default=3, help="Number of short-term frames.")
+    parser.add_argument("--next_short_term_window", type=int, default=6, help="Number of short-term frames.")
     parser.add_argument("--prev_long_term_window", type=int, default=90, help="Number of long-term frames.")
     parser.add_argument("--next_long_term_window", type=int, default=60, help="Number of long-term frames.")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to the checkpoint to resume training.")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for optimizer.")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs for training.")
-    parser.add_argument("--stm_heads", type=int, default=1, help="Number of attention heads.")
-    parser.add_argument("--ltm_heads", type=int, default=24, help="Number of attention heads.")
-    parser.add_argument("--ltm_layers", type=int, default=8, help="Number of Transformer layers.")
-    parser.add_argument("--attn_heads", type=int, default=32, help="Number of attention heads.")
-    parser.add_argument("--attn_bias_factor", type=float, default=0.33, help="Number of attention heads.")
-    parser.add_argument("--attn_layers", type=int, default=2, help="Number of Transformer layers.")
-    parser.add_argument("--diff_steps", type=int, default=1024, help="Number of diffusion steps.")
+    parser.add_argument("--stm_heads", type=int, default=32, help="Number of attention heads.")
+    parser.add_argument("--ltm_heads", type=int, default=6, help="Number of attention heads.")
+    parser.add_argument("--ltm_layers", type=int, default=4, help="Number of Transformer layers.")
+    parser.add_argument("--attn_heads", type=int, default=3, help="Number of attention heads.")
+    parser.add_argument("--attn_layers", type=int, default=4, help="Number of Transformer layers.")
+    parser.add_argument("--agg_heads", type=int, default=24, help="Number of attention heads.")
 
     parser.add_argument("--tune", action="store_true", help="Tune hyperparameters using Optuna.", default=False)
     
@@ -100,17 +99,6 @@ def objective(trial):
         ltm_prev_window = ltm_prev_window,
         ltm_next_window = ltm_next_window,
 
-        # ShortTermTemporalModule
-        # stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
-
-        # LongTermTemporalModule
-
-        # BiasedConditionalSelfAttention
-
-        # DiffusionModel
-        diff_beta_start = 0.0001,
-        diff_beta_end = 0.02,
-
         stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
 
         # LongTermTemporalModule
@@ -118,8 +106,8 @@ def objective(trial):
         ltm_layers = trial.suggest_int("ltm_layers", 1, 32),
 
         # BiasedConditionalSelfAttention
-        attn_heads = trial.suggest_categorical("attn_heads", divisible_by_768),
-        attn_layers = trial.suggest_int("attn_layers", 1, 32),
+        attn_heads = trial.suggest_categorical("attn_heads", [1, 2, 3, 4, 6]),
+        attn_layers = trial.suggest_int("attn_layers", 1, 10),
 
         # MultiFrameAttentionAggregator
         agg_heads = trial.suggest_categorical("agg_heads", divisible_by_768),
@@ -138,6 +126,9 @@ def objective(trial):
         devices=num_devices,
     )
 
+    # batch_size = trial.suggest_int("batch_size", 1, 8)
+    batch_size = 16
+
     # Create DataLoaders with the suggested batch size
     args = parse_args()
     train_loader, val_loader = prepare_dataloaders(
@@ -146,7 +137,8 @@ def objective(trial):
         stm_next_window,
         ltm_prev_window,
         ltm_next_window,
-        trial.suggest_int("batch_size", 1, 8),
+        batch_size,
+        
     )
     trainer.fit(model, train_loader, val_loader)
 
@@ -294,7 +286,7 @@ def main():
         study = optuna.create_study(
             direction="minimize",
             storage="sqlite:///optuna.db",
-            study_name="speech_to_expression3",
+            study_name="speech_to_expression4",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)
@@ -331,12 +323,7 @@ def main():
         # BiasedConditionalSelfAttention
         attn_heads = args.attn_heads,
         attn_layers = args.attn_layers,
-        attn_bias_factor = args.attn_bias_factor,
-
-        # DiffusionModel
-        diff_steps = args.diff_steps,
-        diff_beta_start = 0.0001,
-        diff_beta_end = 0.02,
+        agg_heads = args.agg_heads,
     )
 
     if args.resume_checkpoint:
