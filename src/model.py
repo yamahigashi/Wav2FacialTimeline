@@ -292,6 +292,17 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.reducer = DimensionalityReducer(hparams.embed_dim, hparams.output_dim)
         self.lr = hparams.lr
 
+        # TODO: Extract the weights from the hyperparameters
+        weights = torch.ones(hparams.output_dim)
+        weights[0] = 0.001  # Set a small weight for the FaceScore
+        weights[1:28] = 0.9  # Set a small weight for the Action Units
+        weights[17] = 1.0  # AU25: lips part
+        weights[18] = 1.0  # AU26: jaw drop
+        weights[20] = 1.0  # AU28: eyes closed
+        weights[21:28] = 1.0  # Emotions
+        weights[28:31] = 0.5  # Set a medium weight for the Pose features
+        self.register_buffer("weights", weights.expand_as(torch.ones(hparams.output_dim)))
+
         self.memory_weights = nn.Parameter(torch.ones(2))
 
         self.save_hyperparameters()
@@ -381,20 +392,29 @@ class SpeechToExpressionModel(pl.LightningModule):
             global_frame_masks,
             current_short_frame,
             current_long_frame
-        ) # type: Float[Array, "batch_size", "embed_dim"]
+        ) # type: Float[Array, "batch_size", "output_dim"]
         labels = labels.expand(outputs.shape[0], -1)  # extend to batch dimension
+        reliabilities = labels[:, 0]  # extract the reliability labels, FaceScore
+        reliabilities = reliabilities.unsqueeze(1)  # (batch_size, 1)
+        reliabilities = reliabilities.expand_as(outputs)  # (batch_size, output_dim)
 
         # Calculate the mean squared error loss
-        loss = nn.functional.mse_loss(outputs, labels)
+        loss = nn.functional.mse_loss(
+            outputs * self.weights,
+            labels * self.weights,
+            reduction="none"
+        )
+        weighted_loss = loss * reliabilities
+        weighted_loss = weighted_loss.mean()
 
-        weights = torch.softmax(self.memory_weights, dim=0)
+        temporal_weights = torch.softmax(self.memory_weights, dim=0)
 
         # loss += emo_loss
-        self.log("train_loss", loss)
-        self.log("short_term_weight", weights[0])
-        self.log("long_term_weight", weights[1])
+        self.log("train_loss", weighted_loss)
+        self.log("short_term_weight", temporal_weights[0])
+        self.log("long_term_weight", temporal_weights[1])
 
-        return loss
+        return weighted_loss
 
     def validation_step(self, batch, batch_idx):
         # type: (Batch, int) -> None
