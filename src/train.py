@@ -99,18 +99,18 @@ def objective(trial):
         ltm_prev_window = ltm_prev_window,
         ltm_next_window = ltm_next_window,
 
-        stm_heads = trial.suggest_categorical("stm_heads", divisible_by_768),
+        stm_heads = trial.suggest_categorical("stm_heads", [4, 16, 48, 64, 96, 128]),
 
         # LongTermTemporalModule
-        ltm_heads = trial.suggest_categorical("ltm_heads", divisible_by_768),
-        ltm_layers = trial.suggest_int("ltm_layers", 1, 32),
+        ltm_heads = trial.suggest_categorical("ltm_heads", [4, 16, 64, 96, 128]),
+        ltm_layers = trial.suggest_int("ltm_layers", 2, 6),
 
         # BiasedConditionalSelfAttention
-        attn_heads = trial.suggest_categorical("attn_heads", [1, 2, 3, 4, 6]),
+        attn_heads = trial.suggest_categorical("attn_heads", [1, 2, 3, 4, 6, 8, 48]),
         attn_layers = trial.suggest_int("attn_layers", 1, 10),
 
         # MultiFrameAttentionAggregator
-        agg_heads = trial.suggest_categorical("agg_heads", divisible_by_768),
+        agg_heads = trial.suggest_categorical("agg_heads", [1, 2, 3, 4, 6, 8, 16]),
     )
     
     # Pass the suggested hyperparameters into your model
@@ -286,7 +286,7 @@ def main():
         study = optuna.create_study(
             direction="minimize",
             storage="sqlite:///optuna.db",
-            study_name="speech_to_expression4",
+            study_name="speech_to_expression7",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)
