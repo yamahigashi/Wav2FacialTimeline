@@ -306,7 +306,7 @@ def main():
     hparams = HyperParameters(
         embed_dim = WAV2VEC2_EMBED_DIM,
         output_dim = FACIAL_FEATURE_DIM,
-        lr = 1e-3,
+        lr = args.learning_rate,
 
         stm_prev_window = args.prev_short_term_window,
         stm_next_window = args.next_short_term_window,
