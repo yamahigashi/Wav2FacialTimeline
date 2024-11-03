@@ -7,8 +7,8 @@ import utils
 
 import typing
 if typing.TYPE_CHECKING:
-    Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
-    BatchData = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
+    Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
+    BatchData = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
 
 
 class SpeakerDataset(Dataset):
@@ -112,11 +112,15 @@ class SpeakerDataset(Dataset):
             self.next_long_term_window,
             self.embed_dim,
         )
-        # print(f"get frame {file_frame_idx:04d}/{audio_length} ({current_short_frame}) {short_frame_mask}")
 
         labels = torch.tensor(facial_expressions[file_frame_idx], dtype=torch.float32)  # Label for the current frame
 
-        return short_term_features, long_term_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame, labels
+        if file_frame_idx == 0:
+            last_x = torch.zeros_like(labels)
+        else:
+            last_x = torch.tensor(facial_expressions[file_frame_idx - 1], dtype=torch.float32)
+
+        return last_x, short_term_features, long_term_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame, labels
 
 
 def open_hdf5_file(_worker_id):

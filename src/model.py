@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
+import config as conf
+
 import typing
 if typing.TYPE_CHECKING:
     from typing import (
@@ -19,35 +21,9 @@ if typing.TYPE_CHECKING:
         Batch,  # noqa: F401
     )
 
-MAX_WINDOW_SIZE = 600
-
-
-@dataclasses.dataclass
-class HyperParameters:
-    """Hyperparameters for the SpeechToExpressionModel"""
-
-    embed_dim: int = 768
-    output_dim: int = 31
-    lr: float = 1e-5
-
-    stm_prev_window: int = 3
-    stm_next_window: int = 6
-    ltm_prev_window: int = 90
-    ltm_next_window: int = 60
-
-    # ShortTermTemporalModule
-    stm_heads: int = 32 
-
-    # LongTermTemporalModule
-    ltm_heads: int = 6
-    ltm_layers: int = 4
-
-    # FeatureAttentionProcessor
-    attn_heads: int = 3
-    attn_layers: int = 4
-
-    # MultiFrameAttentionAggregator
-    agg_heads: int = 24
+    Label = Float[Array, "batch_size", "output_dim"]
+    Seq1st = Float[Array, "seq_len", "batch", "embed_dim"]
+    Batch1st = Float[Array, "batch", "seq_len", "embed_dim"]
 
 
 class ShortTermTemporalModule(nn.Module):
@@ -65,13 +41,19 @@ class ShortTermTemporalModule(nn.Module):
         self.attention = nn.MultiheadAttention(embed_dim, num_heads)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, frame_features, key_padding_mask):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+    def forward(self, frame_features, key_padding_mask, timestep_emb):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"], Float[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
         """Forward pass of the ShortTermTemporalModule
 
         Args:
             frame_features (torch.Tensor): The input frame features
         """
+
+        # TODO: this should be extracted from the input
+        seq_len, batch_size, _ = frame_features.size()
+        timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
+        frame_features = torch.cat([frame_features, timestep_emb_expanded], dim=-1)
+
         attn_output, _ = self.attention(
             frame_features, frame_features, frame_features,
             key_padding_mask=key_padding_mask
@@ -98,8 +80,8 @@ class LongTermTemporalModule(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, global_frame_features, src_key_padding_mask):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+    def forward(self, global_frame_features, src_key_padding_mask, timestep_emb):
+        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"], Float[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
         """Forward pass of the LongTermTemporalModule
 
         The input features should be in the sequence-first format, Transfomer expects the input to be
@@ -113,6 +95,11 @@ class LongTermTemporalModule(nn.Module):
         Returns:
             torch.Tensor: Output of the transformer encoder
         """
+
+        # TODO: this should be extracted from the input
+        seq_len, batch_size, _ = global_frame_features.size()
+        timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
+        global_frame_features = torch.cat([global_frame_features, timestep_emb_expanded], dim=-1)
 
         attn_output = self.transformer_encoder(
             global_frame_features,
@@ -208,67 +195,185 @@ class PositionalEncoding(pl.LightningModule):
         return x
 
 
-class FeatureAttentionProcessor(nn.Module):
+class SiLU(nn.Module):
 
-    def __init__(self, embed_dim, num_heads, num_layers):
-        super(FeatureAttentionProcessor, self).__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.layer_norm = nn.LayerNorm(embed_dim)
+    @staticmethod
+    def forward(x):
+        return x * torch.sigmoid(x)
 
-    def forward(self, input_features):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
 
-        attn_output = self.transformer_encoder(input_features)
-        output = self.layer_norm(attn_output)
+class GaussianDiffusion(nn.Module):
+    """Gaussian Diffusion model. Forwarding through the module returns diffusion reversal scalar loss tensor.
+    Input:
+        x: tensor of shape (N, img_channels, *img_size)
+        y: tensor of shape (N)
+    Output:
+        scalar loss tensor
+    """
+    def __init__(
+        self,
+        config: conf.DiffusionConfig,
+        embed_dim: int,
+        output_dim: int,
+        time_embed_dim: int,
+        short_term_module: ShortTermTemporalModule,
+        long_term_module: LongTermTemporalModule,
+        st_window: int,
+        lt_window: int
+    ):
+
+        super().__init__()
+
+        self.time_step_num = config.time_step_num
+        self.time_embed_dim = time_embed_dim
+        self.estimate_mode = config.estimate_mode
+
+        self.timestep_embedding = nn.Embedding(self.time_step_num + 1, self.time_embed_dim)
+        self.short_term_module = short_term_module
+        self.long_term_module = long_term_module
+
+        self.model = NoiseDecoder(
+            config.noise_decorder_config,
+            output_dim,
+            st_window + lt_window,
+            embed_dim + time_embed_dim,
+        )
+
+        betas = self._generate_diffusion_schedule()
+        alphas = 1. - betas
+        alphas_cumprod = np.cumprod(alphas)
+
+        self.register_buffer("betas", torch.tensor(betas))
+        self.register_buffer("alphas", torch.tensor(alphas))
+        self.register_buffer("alphas_cumprod", torch.tensor(alphas_cumprod))
+
+        self.register_buffer("sqrt_alphas_cumprod", torch.tensor(np.sqrt(alphas_cumprod)))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.tensor(np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer("reciprocal_sqrt_alphas", torch.tensor(np.sqrt(1. / alphas)))
+        self.register_buffer("reciprocal_sqrt_alphas_cumprod", torch.tensor(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer("reciprocal_sqrt_alphas_cumprod_m1", torch.tensor(np.sqrt(1. / alphas_cumprod -1)))
+        self.register_buffer("remove_noise_coeff", torch.tensor(betas / np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer("sigma", torch.tensor(np.sqrt(betas)))
+
+    def _generate_diffusion_schedule(self, s=0.008):
+        # type: (float) -> np.ndarray
+
+        def f(t, T):
+            # type: (int, int) -> float
+            return (np.cos((t / T + s) / (1 + s) * np.pi / 2)) ** 2
+
+        # Cosine schedule for beta
+        # from https://arxiv.org/abs/2102.09672  
+        alphas = []
+        f0 = f(0, self.time_step_num)
+
+        for t in range(self.time_step_num + 1):
+            alphas.append(f(t, self.time_step_num) / f0)
+        
+        betas = []
+
+        for t in range(1, self.time_step_num + 1):
+            betas.append(min(1 - alphas[t] / alphas[t - 1], 0.999))
+        return np.array(betas)
+
+    @torch.no_grad()
+    def extract(self, a, ts, x_shape):
+        b, *_ = ts.shape
+        out = a.gather(-1, ts)
+        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+    @torch.no_grad()
+    def add_noise(self, x, ts):
+        return x + self.extract(self.sigma, ts, x.shape) * torch.randn_like(x)
+
+    def add_noise_w(self, x, ts, noise):
+        return x + self.extract(self.sigma, ts, x.shape) * noise#torch.randn_like(x)
+
+    @torch.no_grad()
+    def compute_alpha(self, beta, ts):
+        beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
+        a = (1 - beta).cumprod(dim=0).index_select(0, ts + 1).view(-1, 1)
+        return a
+
+    @torch.no_grad()
+    def remove_noise(self, xt, pred, ts):
+        output =  (xt - self.extract(self.remove_noise_coeff, ts, pred.shape) * pred) * \
+                self.extract(self.reciprocal_sqrt_alphas, ts, pred.shape)
+
         return output
 
-
-class MultiFrameAttentionAggregator(nn.Module):
-
-    def __init__(self, embed_dim, num_heads):
-        # type: (int, int) -> None
-
-        super(MultiFrameAttentionAggregator, self).__init__()
-
-        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, attn_output):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"]) -> Float[Array, "batch", "embed_dim"]
-
-        # attn_output: (seq_len, batch_size, embed_dim)
-        # attn_weights: (batch_size, seq_len, seq_len)
-        attn_output, attn_weights = self.multihead_attn(attn_output, attn_output, attn_output)
-        permuted_output = attn_output.permute(1, 0, 2)  # (batch_size, seq_len, embed_dim)
-        attn_scores = attn_weights.mean(dim=-1)  # (batch_size, seq_len)
-        attn_scores = attn_scores.unsqueeze(-1)  # (batch_size, seq_len, 1)
-        output = (permuted_output * attn_scores).sum(dim=1)  # (batch_size, embed_dim)
-
-        norm_output = self.layer_norm(output)
-        return norm_output
-
-
-class DimensionalityReducer(nn.Module):
-
-    def __init__(self, embed_dim, output_dim):
-        super(DimensionalityReducer, self).__init__()
-        self.projection = nn.Linear(embed_dim, output_dim)
-        self.gelu = nn.GELU()
-
-    def forward(self, aggregated_features):
-        # type: (Float[Array, "batch", "embed_dim"]) -> Float[Array, "batch", "output_dim"]
-
-        output = self.projection(aggregated_features)  # (batch_size, output_dim)
-        output = self.gelu(output)  # 非線形活性化を適用
+    def get_x0_from_xt(self, xt, ts, noise):
+        output =  (xt - self.extract(self.sqrt_one_minus_alphas_cumprod, ts, xt.shape) * noise) * \
+                self.extract(self.reciprocal_sqrt_alphas_cumprod, ts, xt.shape)
         return output
+
+    def get_eps_from_x0(self, xt, ts, pred_x0):
+        return (xt * self.extract(self.reciprocal_sqrt_alphas_cumprod, ts, xt.shape)  - pred_x0) / \
+            self.extract(self.reciprocal_sqrt_alphas_cumprod_m1, ts, xt.shape)
+
+    def perturb_x(self, x, ts, noise):
+        return (
+            self.extract(self.sqrt_alphas_cumprod, ts, x.shape) * x +
+            self.extract(self.sqrt_one_minus_alphas_cumprod, ts, x.shape) * noise
+        )   
+
+    def forward(self, cur_x, next_x, ts, st_features, lt_features, key_padding_mask, global_key_padding_mask):
+
+        timestep_emb = self.timestep_embedding(ts)
+        st_latent = self.short_term_module(st_features, key_padding_mask, timestep_emb)
+        lt_latent = self.long_term_module(lt_features, global_key_padding_mask, timestep_emb)
+
+        batch_size = cur_x.shape[0]
+        if ts is None:
+            ts = torch.randint(0, self.time_step_num, (batch_size,))
+
+        noise = torch.randn_like(next_x)
+        perturbed_x = self.perturb_x(next_x, ts.clone(), noise)
+        
+        estimated = self.model(cur_x, perturbed_x, st_latent, lt_latent)
+
+        return estimated, noise, perturbed_x, ts
+
+
+class NoiseDecoder(nn.Module):
+
+    def __init__(self, config, output_dim, window_size, embed_dim):
+        # type: (conf.NoiseDecoderConfig, int, int, int) -> None
+
+        super().__init__()
+
+        self.hidden_dim = config.hidden_dim
+        self.query_proj = nn.Linear(output_dim * 2, config.hidden_dim)
+        self.kv_proj = nn.Linear(embed_dim, config.hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            config.hidden_dim,
+            num_heads=config.head_num
+        )
+
+        self.fin = nn.Linear(config.hidden_dim, output_dim)
+  
+    def forward(self, xcur, xnext, st_latent, lt_latent):
+        # type: (Label, Label, Seq1st, Seq1st) -> Label
+
+        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # type: Seq1st
+
+        queries = torch.cat([xcur, xnext], dim=-1).unsqueeze(0).float()  # (1, batch_size, 2*output_dim)
+        proj_queries = self.query_proj(queries)  # (1, batch_size, hidden_dim)
+        proj_kv = self.kv_proj(temporal_features)  # (seq_len, batch_size, hidden_dim)
+
+        attn_output, _ = self.cross_attn(proj_queries, proj_kv, proj_kv)
+
+        x = attn_output.squeeze(0)
+        x = self.fin(x)
+
+        return x 
 
 
 class SpeechToExpressionModel(pl.LightningModule):
     """Temporal Diffusion Speaker Model"""
 
-    def __init__(self, hparams):
-        # type: (HyperParameters) -> None
+    def __init__(self, config):
+        # type: (conf.SpeechToExpressionConfig) -> None
         """Initialize the SpeechToExpressionModel
 
         Args:
@@ -280,28 +385,28 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
         super(SpeechToExpressionModel, self).__init__()
 
-        short_term_window = hparams.stm_prev_window + hparams.stm_next_window + 1
-        long_term_window = hparams.ltm_prev_window + hparams.ltm_next_window + 1
+        short_term_window = config.st.prev_window + config.st.next_window + 1
+        long_term_window = config.lt.prev_window + config.lt.next_window + 1
         
-        self.short_term_module = ShortTermTemporalModule(hparams.embed_dim, hparams.stm_heads)
-        self.long_term_module = LongTermTemporalModule(hparams.embed_dim, hparams.ltm_heads, hparams.ltm_layers)
-        self.short_positional_encoding = PositionalEncoding(hparams.embed_dim, short_term_window)
-        self.long_positional_encoding = PositionalEncoding(hparams.embed_dim, long_term_window)
-        self.attn_processor = FeatureAttentionProcessor(hparams.embed_dim, hparams.attn_heads, hparams.attn_layers)
-        self.aggregator = MultiFrameAttentionAggregator(hparams.embed_dim, hparams.agg_heads)
-        self.reducer = DimensionalityReducer(hparams.embed_dim, hparams.output_dim)
-        self.lr = hparams.lr
+        self.short_positional_encoding = PositionalEncoding(config.embed_dim, short_term_window)
+        self.long_positional_encoding = PositionalEncoding(config.embed_dim, long_term_window)
 
-        # TODO: Extract the weights from the hyperparameters
-        weights = torch.ones(hparams.output_dim)
-        weights[0] = 0.001  # Set a small weight for the FaceScore
-        weights[1:28] = 0.9  # Set a small weight for the Action Units
-        weights[17] = 1.0  # AU25: lips part
-        weights[18] = 1.0  # AU26: jaw drop
-        weights[20] = 1.0  # AU28: eyes closed
-        weights[21:28] = 1.0  # Emotions
-        weights[28:31] = 0.5  # Set a medium weight for the Pose features
-        self.register_buffer("weights", weights.expand_as(torch.ones(hparams.output_dim)))
+        embed_dim = config.embed_dim + config.time_embed_dim
+        self.short_term_module = ShortTermTemporalModule(embed_dim, config.st.head_num)
+        self.long_term_module = LongTermTemporalModule(embed_dim, config.lt.head_num, config.lt.layer_num)
+
+        self.diffusion = GaussianDiffusion(
+            config.diffusion,
+            config.embed_dim,
+            config.output_dim,
+            config.time_embed_dim,
+            self.short_term_module,
+            self.long_term_module,
+            short_term_window,
+            long_term_window
+        )
+
+        self.lr = config.lr
 
         self.memory_weights = nn.Parameter(torch.ones(2))
 
@@ -309,16 +414,17 @@ class SpeechToExpressionModel(pl.LightningModule):
 
     def forward(
             self,
+            input_last_x,
             frame_features,
             global_frame_features,
             frame_masks,
             global_frame_masks,
             current_short_frame,
             current_long_frame,
-            speaker_labels=None,
+            input_ts=20,
             inference=False
     ):
-        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor|None, bool) -> torch.Tensor
+        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool) -> torch.Tensor
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -332,7 +438,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         Args:
             frame_features (torch.Tensor): The input frame features
             global_frame_features (torch.Tensor): The input global frame features
-            condition (torch.Tensor): The input condition
 
         Returns:
             torch.Tensor: The output features
@@ -345,21 +450,33 @@ class SpeechToExpressionModel(pl.LightningModule):
         frame_features = frame_features.permute(1, 0, 2)
         global_frame_features = global_frame_features.permute(1, 0, 2)
 
-        short_term_output = self.short_term_module(frame_features, frame_masks)
-        long_term_output = self.long_term_module(global_frame_features, global_frame_masks)
+        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
+        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
 
-        weights = torch.softmax(self.memory_weights, dim=0)
-        weighted_short_term = weights[0] * short_term_output
-        weighted_long_term = weights[1] * long_term_output
-        encoded_short_term = self.short_positional_encoding(weighted_short_term, current_short_frame)
-        encoded_long_term = self.long_positional_encoding(weighted_long_term, current_long_frame)
-        combined_features = torch.cat((encoded_short_term, encoded_long_term), dim=0)
+        x = torch.zeros_like(input_last_x)
+        assert x.dtype == torch.float32
+        assert input_last_x.dtype == torch.float32
 
-        attention_output = self.attn_processor(combined_features)
-        aggregated_features = self.aggregator(attention_output)
-        final_output = self.reducer(aggregated_features)
+        for t in range(input_ts - 1, -1, -1):
+            ts = torch.tensor([t] * batch_size, device=x.device, dtype=torch.long)
 
-        return final_output
+            pred, noise, perturbed_x, ts = self.diffusion(
+                input_last_x,
+                x,
+                ts,
+                st_encoded,
+                lt_encoded,
+                frame_masks,
+                global_frame_masks
+            )
+
+            x = self.diffusion.remove_noise(x, pred, ts)
+
+            # TODO: Add noise to the input
+            # if t > 0:
+            #     x = self.diffusion.add_noise_w(x, ts, input_noises[:,t])
+
+        return x
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -376,6 +493,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         (
+            input_last_x,
             frame_features,
             global_frame_features,
             frame_masks,
@@ -386,6 +504,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         ) = batch
 
         outputs = self(
+            input_last_x,
             frame_features,
             global_frame_features,
             frame_masks,
@@ -400,19 +519,23 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         # Calculate the mean squared error loss
         loss = nn.functional.mse_loss(
-            outputs * self.weights,
-            labels * self.weights,
+            outputs,
+            labels,
             reduction="none"
         )
         weighted_loss = loss * reliabilities
         weighted_loss = weighted_loss.mean()
 
-        temporal_weights = torch.softmax(self.memory_weights, dim=0)
-
         # loss += emo_loss
         self.log("train_loss", weighted_loss)
-        self.log("short_term_weight", temporal_weights[0])
-        self.log("long_term_weight", temporal_weights[1])
+
+        if torch.isnan(weighted_loss).any():
+            print(f"Nan detected in the loss at batch {batch_idx}")
+            print(f"Loss: {weighted_loss}")
+            print(f"Outputs: {outputs}")
+            print(f"Labels: {labels}")
+            print(f"Reliabilities: {reliabilities}")
+            raise ValueError("Nan detected in the loss")
 
         return weighted_loss
 
@@ -427,6 +550,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         (
+            input_last_x,
             frame_features,
             global_frame_features,
             frame_masks,
@@ -437,6 +561,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         ) = batch
 
         outputs = self(
+            input_last_x,
             frame_features,
             global_frame_features,
             frame_masks,

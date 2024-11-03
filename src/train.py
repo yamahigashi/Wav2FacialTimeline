@@ -14,7 +14,8 @@ from dataset import (
     SpeakerDataset,
     open_hdf5_file,
 )
-from model import SpeechToExpressionModel, HyperParameters
+from model import SpeechToExpressionModel
+import config
 
         
 tpu_available = False
@@ -54,22 +55,15 @@ def parse_args():
     
     # Dataset and model arguments
     parser.add_argument("--hdf5_file", type=str, required=True, help="Path to the HDF5 file.")
-    parser.add_argument("--prev_short_term_window", type=int, default=3, help="Number of short-term frames.")
-    parser.add_argument("--next_short_term_window", type=int, default=6, help="Number of short-term frames.")
-    parser.add_argument("--prev_long_term_window", type=int, default=90, help="Number of long-term frames.")
-    parser.add_argument("--next_long_term_window", type=int, default=60, help="Number of long-term frames.")
     parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to the checkpoint to resume training.")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for optimizer.")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs for training.")
-    parser.add_argument("--stm_heads", type=int, default=32, help="Number of attention heads.")
-    parser.add_argument("--ltm_heads", type=int, default=6, help="Number of attention heads.")
-    parser.add_argument("--ltm_layers", type=int, default=4, help="Number of Transformer layers.")
-    parser.add_argument("--attn_heads", type=int, default=3, help="Number of attention heads.")
-    parser.add_argument("--attn_layers", type=int, default=4, help="Number of Transformer layers.")
-    parser.add_argument("--agg_heads", type=int, default=24, help="Number of attention heads.")
+
+    # Model hyperparameters
+    parser.add_argument("--config_file", type=str, default=None, help="Path to the configuration file.")
 
     parser.add_argument("--tune", action="store_true", help="Tune hyperparameters using Optuna.", default=False)
     
@@ -81,7 +75,7 @@ def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
 
-    divisible_by_768 = [i for i in range(1, 129) if 768 % i == 0]
+    # divisible_by_768 = [i for i in range(1, 129) if 768 % i == 0]
     stm_prev_window = 3
     stm_next_window = 6
     ltm_prev_window = 90
@@ -174,7 +168,16 @@ def collate_fn(batch):
         tuple: A tuple containing the padded short-term features, long-term features, labels, and masks.
     """
 
-    short_term_features, long_term_features, short_term_masks, long_term_masks, current_short_frame, current_long_frame, labels = zip(*batch)
+    (
+        input_last_x,
+        short_term_features,
+        long_term_features,
+        short_term_masks,
+        long_term_masks,
+        current_short_frame,
+        current_long_frame,
+        labels
+    )= zip(*batch)
 
     # Get the lengths of each sequence
     short_term_lengths = [x.shape[0] for x in short_term_features]
@@ -207,11 +210,13 @@ def collate_fn(batch):
     long_term_masks = torch.tensor(long_term_masks)
 
     labels_batch = torch.stack(labels)
+    input_last_x_batch = torch.stack(input_last_x)
 
     current_short_frame_batch = torch.tensor(current_short_frame)
     current_long_frame_batch = torch.tensor(current_long_frame)
 
     return (
+        input_last_x_batch,
         short_term_batch,
         long_term_batch,
         short_term_masks,
@@ -286,44 +291,60 @@ def main():
         study = optuna.create_study(
             direction="minimize",
             storage="sqlite:///optuna.db",
-            study_name="speech_to_expression7",
+            study_name="speech_to_expression_b1",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)
         show_best_parameters(study)
         return
 
+    if args.config_file:
+        # Load hyperparameters from a configuration file
+        hparams = config.load_from_yaml(args.config_file)
+
+    else:
+        hparams = config.SpeechToExpressionConfig(
+            model="speech_to_expression",
+            embed_dim=WAV2VEC2_EMBED_DIM,
+            time_embed_dim=100,
+            output_dim=FACIAL_FEATURE_DIM,
+            lr=args.learning_rate,
+            st=config.ShortTermConfig(
+                prev_window=3,
+                next_window=6,
+                head_num=2,
+            ),
+            lt=config.LongTermConfig(
+                prev_window=90,
+                next_window=60,
+                head_num=2,
+                layer_num=2,
+            ),
+            diffusion=config.DiffusionConfig(
+                model="ddpm",
+                sample_mode="ancestral",
+                estimate_mode="reverse",
+                loss_type="l1",
+                noise_schedule_mode="linear",
+                noise_decorder_config=config.NoiseDecoderConfig(
+                    head_num=4,
+                    hidden_dim=1024,
+                    layer_num=15,
+                    activation="SiLU",
+                    norm_type="layer_norm",
+                ),
+                time_step_num=20,
+            ),
+        )
+
     # Prepare the dataset and dataloaders
     train_loader, val_loader = prepare_dataloaders(
         args.hdf5_file,
-        args.prev_short_term_window,
-        args.next_short_term_window,
-        args.prev_long_term_window, 
-        args.next_long_term_window, 
+        hparams.st.prev_window,
+        hparams.st.next_window,
+        hparams.lt.prev_window,
+        hparams.lt.next_window,
         args.batch_size,
-    )
-
-    hparams = HyperParameters(
-        embed_dim = WAV2VEC2_EMBED_DIM,
-        output_dim = FACIAL_FEATURE_DIM,
-        lr = args.learning_rate,
-
-        stm_prev_window = args.prev_short_term_window,
-        stm_next_window = args.next_short_term_window,
-        ltm_prev_window = args.prev_long_term_window,
-        ltm_next_window = args.next_long_term_window,
-
-        # ShortTermTemporalModule
-        stm_heads = args.stm_heads,
-
-        # LongTermTemporalModule
-        ltm_heads = args.ltm_heads,
-        ltm_layers = args.ltm_layers,
-
-        # BiasedConditionalSelfAttention
-        attn_heads = args.attn_heads,
-        attn_layers = args.attn_layers,
-        agg_heads = args.agg_heads,
     )
 
     if args.resume_checkpoint:

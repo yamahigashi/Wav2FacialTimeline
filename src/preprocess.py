@@ -86,8 +86,10 @@ def preprocess(movie_dir, output_file, frame_rate, audio_dir=None):
             file_names = []
 
         # for idx, file in enumerate(pathlib.Path(movie_dir).rglob("01-*.mp4")):
+        # files = list(pathlib.Path(movie_dir).rglob("01-*.mp4"))  # MEAD
         # files = list(pathlib.Path(movie_dir).rglob("**/front/**/*.mp4"))
         files = list(pathlib.Path(movie_dir).rglob("*.mp4"))
+        # files = files + list(pathlib.Path(movie_dir).rglob("*.flv"))
         random.shuffle(files)
         for idx, file in enumerate(files):
             file_key = file.as_posix().replace("/", "_")
@@ -170,6 +172,7 @@ def repair_nan_inf_to_minus_one(file_path):
         return data
 
     with h5py.File(file_path, "a") as hdf5_file:
+        print(f"checking {file_path} for NaN or infinite values {len(hdf5_file.keys())}")
         for i, dataset_name in enumerate(hdf5_file):
             expressions = hdf5_file[dataset_name]["facial_expression"][:]
             audio_features = hdf5_file[dataset_name]["audio_feature"][:]
