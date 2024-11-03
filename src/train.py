@@ -357,7 +357,7 @@ def main():
 
     # Set up logging using TensorBoard
     log_dir = pathlib.Path(__file__).parent.parent / "logs"
-    logger = TensorBoardLogger(log_dir.as_posix(), name="speech_to_expression")
+    logger = TensorBoardLogger(log_dir.as_posix(), name="diffusion")
 
     # Set up checkpoints to save the best model
     checkpoint_callback = ModelCheckpoint(

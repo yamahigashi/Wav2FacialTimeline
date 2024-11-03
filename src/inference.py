@@ -13,6 +13,7 @@ from model import SpeechToExpressionModel  # Assuming your model is saved here
 import typing
 if typing.TYPE_CHECKING:
     from  typing import Generator  # noqa: F401
+    from config import SpeechToExpressionConfig  # noqa: F401
 
 
 ########################################################################################
@@ -24,7 +25,6 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the model checkpoint")
     parser.add_argument("--input_file", type=str, required=True, help="Path to the input audio file")
     parser.add_argument("--output_file", type=str, required=False, help="Path to save the output")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
 
     return parser.parse_args()
 
@@ -39,9 +39,11 @@ def load_model(checkpoint_path, device):
     return model, hparams
 
 
-def preprocess_inference_data(audio_path, hparams, batch_size):
-    # type: (str, dict, int) -> Generator
+def preprocess_inference_data(audio_path, hparams):
+    # type: (str, dict) -> Generator
     """Preprocess input data for inference with batching."""
+
+    batch_size = 1  # Set the batch size to 1 for inference, for sequential processing for now
 
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
     wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
@@ -118,11 +120,11 @@ def preprocess_inference_data(audio_path, hparams, batch_size):
 def get_audio_feature_parameters(audio_features, frame, hparams):
     # type: (torch.Tensor, int, dict) -> ...
 
-    _hparams = hparams.get("hparams")  # type: HParameters
-    pst_window = _hparams.stm_prev_window
-    nst_window = _hparams.stm_next_window
-    plt_window = _hparams.ltm_prev_window
-    nlt_window = _hparams.ltm_next_window
+    _hparams = hparams.get("config", None)  # type: SpeechToExpressionConfig
+    pst_window = _hparams.st.prev_window
+    nst_window = _hparams.st.next_window
+    plt_window = _hparams.lt.prev_window
+    nlt_window = _hparams.lt.next_window
     embed_dim = _hparams.embed_dim
 
     return utils.prepare_audio_features_and_masks(
@@ -138,6 +140,7 @@ def get_audio_feature_parameters(audio_features, frame, hparams):
 
 def run_inference(
         model,
+        last_x,
         frame_features,
         global_frame_features,
         frame_masks,
@@ -158,6 +161,7 @@ def run_inference(
 
     with torch.no_grad():
         output = model(
+            last_x,
             frame_features,
             global_frame_features,
             frame_masks,
@@ -231,14 +235,14 @@ def save_output_to_csv(results, output_file_path):
 def main():
 
     args = parse_args()
-    batch_size = args.batch_size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results = []
     model, hparams = load_model(args.checkpoint, device)
 
-    data_gen = preprocess_inference_data(args.input_file, hparams, batch_size)
+    data_gen = preprocess_inference_data(args.input_file, hparams)
 
+    last_x = torch.zeros(1, 31).to(device)
     for batch in tqdm(data_gen, desc="Processing frames"):
         (
             frame_features,
@@ -251,6 +255,7 @@ def main():
 
         output = run_inference(
             model,
+            last_x,
             frame_features,
             global_frame_features,
             frame_masks,
@@ -261,12 +266,9 @@ def main():
             hparams
         )
 
-        for batch_output in range(batch_size):
-            try:
-                res = output[batch_output].cpu()
-                results.append(res)
-            except IndexError:
-                break
+        last_x = output
+        res = output.cpu()
+        results.append(res)
 
     # Save or process the output
     if args.output_file:

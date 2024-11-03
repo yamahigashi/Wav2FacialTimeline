@@ -250,10 +250,10 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.tensor(np.sqrt(alphas_cumprod)))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.tensor(np.sqrt(1. - alphas_cumprod)))
         self.register_buffer("reciprocal_sqrt_alphas", torch.tensor(np.sqrt(1. / alphas)))
-        self.register_buffer("reciprocal_sqrt_alphas_cumprod", torch.tensor(np.sqrt(1. / alphas_cumprod)))
-        self.register_buffer("reciprocal_sqrt_alphas_cumprod_m1", torch.tensor(np.sqrt(1. / alphas_cumprod -1)))
-        self.register_buffer("remove_noise_coeff", torch.tensor(betas / np.sqrt(1. - alphas_cumprod)))
-        self.register_buffer("sigma", torch.tensor(np.sqrt(betas)))
+        # self.register_buffer("reciprocal_sqrt_alphas_cumprod", torch.tensor(np.sqrt(1. / alphas_cumprod)))
+        # self.register_buffer("reciprocal_sqrt_alphas_cumprod_m1", torch.tensor(np.sqrt(1. / alphas_cumprod -1)))
+        # self.register_buffer("remove_noise_coeff", torch.tensor(betas / np.sqrt(1. - alphas_cumprod)))
+        # self.register_buffer("sigma", torch.tensor(np.sqrt(betas)))
 
     def _generate_diffusion_schedule(self, s=0.008):
         # type: (float) -> np.ndarray
@@ -282,36 +282,13 @@ class GaussianDiffusion(nn.Module):
         out = a.gather(-1, ts)
         return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-    @torch.no_grad()
-    def add_noise(self, x, ts):
-        return x + self.extract(self.sigma, ts, x.shape) * torch.randn_like(x)
+    def remove_noise(self, xt, pred_noise, ts):
+        coef1 = self.extract(self.reciprocal_sqrt_alphas, ts, xt.shape)
+        coef2 = self.extract(self.betas / self.sqrt_one_minus_alphas_cumprod, ts, xt.shape)
+        x_prev = coef1 * (xt - coef2 * pred_noise)
+        return x_prev
 
-    def add_noise_w(self, x, ts, noise):
-        return x + self.extract(self.sigma, ts, x.shape) * noise#torch.randn_like(x)
-
-    @torch.no_grad()
-    def compute_alpha(self, beta, ts):
-        beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
-        a = (1 - beta).cumprod(dim=0).index_select(0, ts + 1).view(-1, 1)
-        return a
-
-    @torch.no_grad()
-    def remove_noise(self, xt, pred, ts):
-        output =  (xt - self.extract(self.remove_noise_coeff, ts, pred.shape) * pred) * \
-                self.extract(self.reciprocal_sqrt_alphas, ts, pred.shape)
-
-        return output
-
-    def get_x0_from_xt(self, xt, ts, noise):
-        output =  (xt - self.extract(self.sqrt_one_minus_alphas_cumprod, ts, xt.shape) * noise) * \
-                self.extract(self.reciprocal_sqrt_alphas_cumprod, ts, xt.shape)
-        return output
-
-    def get_eps_from_x0(self, xt, ts, pred_x0):
-        return (xt * self.extract(self.reciprocal_sqrt_alphas_cumprod, ts, xt.shape)  - pred_x0) / \
-            self.extract(self.reciprocal_sqrt_alphas_cumprod_m1, ts, xt.shape)
-
-    def perturb_x(self, x, ts, noise):
+    def add_noise(self, x, ts, noise):
         return (
             self.extract(self.sqrt_alphas_cumprod, ts, x.shape) * x +
             self.extract(self.sqrt_one_minus_alphas_cumprod, ts, x.shape) * noise
@@ -323,16 +300,9 @@ class GaussianDiffusion(nn.Module):
         st_latent = self.short_term_module(st_features, key_padding_mask, timestep_emb)
         lt_latent = self.long_term_module(lt_features, global_key_padding_mask, timestep_emb)
 
-        batch_size = cur_x.shape[0]
-        if ts is None:
-            ts = torch.randint(0, self.time_step_num, (batch_size,))
+        estimated = self.model(cur_x, next_x, st_latent, lt_latent)
 
-        noise = torch.randn_like(next_x)
-        perturbed_x = self.perturb_x(next_x, ts.clone(), noise)
-        
-        estimated = self.model(cur_x, perturbed_x, st_latent, lt_latent)
-
-        return estimated, noise, perturbed_x, ts
+        return estimated
 
 
 class NoiseDecoder(nn.Module):
@@ -413,18 +383,18 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.save_hyperparameters()
 
     def forward(
-            self,
-            input_last_x,
-            frame_features,
-            global_frame_features,
-            frame_masks,
-            global_frame_masks,
-            current_short_frame,
-            current_long_frame,
-            input_ts=20,
-            inference=False
+        self,
+        input_last_x,
+        frame_features,
+        global_frame_features,
+        frame_masks,
+        global_frame_masks,
+        current_short_frame,
+        current_long_frame,
+        input_ts=None,
+        inference=False
     ):
-        # type: (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool) -> torch.Tensor
+        # type: (Label, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int|None, bool) -> torch.Tensor|Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -453,30 +423,55 @@ class SpeechToExpressionModel(pl.LightningModule):
         st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
         lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
 
-        x = torch.zeros_like(input_last_x)
-        assert x.dtype == torch.float32
-        assert input_last_x.dtype == torch.float32
+        if inference:
 
-        for t in range(input_ts - 1, -1, -1):
-            ts = torch.tensor([t] * batch_size, device=x.device, dtype=torch.long)
+            x = torch.randn_like(input_last_x)  # Start from pure noise
+            for t in reversed(range(self.diffusion.time_step_num)):
+                ts = torch.full((batch_size,), t, device=x.device, dtype=torch.long)
 
-            pred, noise, perturbed_x, ts = self.diffusion(
+                pred_noise = self.diffusion(
+                    input_last_x,
+                    x,
+                    ts,
+                    st_encoded,
+                    lt_encoded,
+                    frame_masks,
+                    global_frame_masks
+                )
+
+                x = self.diffusion.remove_noise(x, pred_noise, ts)
+
+                # if t > 0:
+                #     # Optionally add noise based on the sampling strategy
+                #     noise = torch.randn_like(x)
+                #     x = x + self.diffusion.get_noise_level(ts, x.shape) * noise
+
+            return x
+
+        else:
+            if input_ts is None:
+                input_ts = torch.randint(
+                    0,
+                    self.diffusion.time_step_num,
+                    (batch_size,),
+                    device=frame_features.device
+                )
+
+            noise = torch.randn_like(input_last_x)
+            perturbed_x = self.diffusion.add_noise(input_last_x, input_ts, noise)
+
+            # Model predicts the noise
+            pred_noise = self.diffusion(
                 input_last_x,
-                x,
-                ts,
+                perturbed_x,
+                input_ts,
                 st_encoded,
                 lt_encoded,
                 frame_masks,
                 global_frame_masks
             )
 
-            x = self.diffusion.remove_noise(x, pred, ts)
-
-            # TODO: Add noise to the input
-            # if t > 0:
-            #     x = self.diffusion.add_noise_w(x, ts, input_noises[:,t])
-
-        return x
+            return pred_noise, noise, input_ts
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -503,7 +498,7 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        outputs = self(
+        pred_noise, noise, input_ts = self(
             input_last_x,
             frame_features,
             global_frame_features,
@@ -511,33 +506,11 @@ class SpeechToExpressionModel(pl.LightningModule):
             global_frame_masks,
             current_short_frame,
             current_long_frame
-        ) # type: Float[Array, "batch_size", "output_dim"]
-        labels = labels.expand(outputs.shape[0], -1)  # extend to batch dimension
-        reliabilities = labels[:, 0]  # extract the reliability labels, FaceScore
-        reliabilities = reliabilities.unsqueeze(1)  # (batch_size, 1)
-        reliabilities = reliabilities.expand_as(outputs)  # (batch_size, output_dim)
-
-        # Calculate the mean squared error loss
-        loss = nn.functional.mse_loss(
-            outputs,
-            labels,
-            reduction="none"
         )
-        weighted_loss = loss * reliabilities
-        weighted_loss = weighted_loss.mean()
 
-        # loss += emo_loss
-        self.log("train_loss", weighted_loss)
-
-        if torch.isnan(weighted_loss).any():
-            print(f"Nan detected in the loss at batch {batch_idx}")
-            print(f"Loss: {weighted_loss}")
-            print(f"Outputs: {outputs}")
-            print(f"Labels: {labels}")
-            print(f"Reliabilities: {reliabilities}")
-            raise ValueError("Nan detected in the loss")
-
-        return weighted_loss
+        loss = nn.functional.mse_loss(pred_noise, noise)
+        self.log("train_loss", loss)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         # type: (Batch, int) -> None
@@ -560,7 +533,7 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        outputs = self(
+        outputs, noise, input_ts = self(
             input_last_x,
             frame_features,
             global_frame_features,
@@ -568,7 +541,8 @@ class SpeechToExpressionModel(pl.LightningModule):
             global_frame_masks,
             current_short_frame,
             current_long_frame
-        ) # type: Float[Array, "batch_size", "embed_dim"]
+        )
+
         labels = labels.expand(outputs.shape[0], -1)
         val_loss = nn.functional.mse_loss(outputs, labels)
         self.log("val_loss", val_loss)
