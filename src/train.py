@@ -317,8 +317,8 @@ def main():
             lt=config.LongTermConfig(
                 prev_window=90,
                 next_window=60,
-                head_num=2,
-                layer_num=2,
+                head_num=4,
+                layer_num=4,
             ),
             diffusion=config.DiffusionConfig(
                 model="ddpm",
@@ -327,7 +327,7 @@ def main():
                 loss_type="l1",
                 noise_schedule_mode="linear",
                 noise_decorder_config=config.NoiseDecoderConfig(
-                    head_num=4,
+                    head_num=8,
                     hidden_dim=1024,
                     layer_num=15,
                     activation="SiLU",

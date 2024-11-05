@@ -266,7 +266,7 @@ def main():
             hparams
         )
 
-        last_x = output
+        # last_x = output
         res = output.cpu()
         results.append(res)
 

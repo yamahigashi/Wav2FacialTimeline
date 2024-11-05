@@ -1,5 +1,3 @@
-import dataclasses
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -242,6 +240,12 @@ class GaussianDiffusion(nn.Module):
         betas = self._generate_diffusion_schedule()
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas)
+        alphas_cumprod_prev = np.concatenate(([1.0], alphas_cumprod[:-1]))
+
+        # Compute the sigma for each timestep
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        # For t=0, posterior_variance is set to a small value to prevent division by zero
+        posterior_variance = np.append(posterior_variance, [1e-20])
 
         self.register_buffer("betas", torch.tensor(betas))
         self.register_buffer("alphas", torch.tensor(alphas))
@@ -250,10 +254,9 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("sqrt_alphas_cumprod", torch.tensor(np.sqrt(alphas_cumprod)))
         self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.tensor(np.sqrt(1. - alphas_cumprod)))
         self.register_buffer("reciprocal_sqrt_alphas", torch.tensor(np.sqrt(1. / alphas)))
-        # self.register_buffer("reciprocal_sqrt_alphas_cumprod", torch.tensor(np.sqrt(1. / alphas_cumprod)))
-        # self.register_buffer("reciprocal_sqrt_alphas_cumprod_m1", torch.tensor(np.sqrt(1. / alphas_cumprod -1)))
-        # self.register_buffer("remove_noise_coeff", torch.tensor(betas / np.sqrt(1. - alphas_cumprod)))
-        # self.register_buffer("sigma", torch.tensor(np.sqrt(betas)))
+
+        self.register_buffer("posterior_variance", torch.tensor(posterior_variance))
+        self.register_buffer("posterior_log_variance_clipped", torch.log(torch.clamp(torch.tensor(posterior_variance), min=1e-20)))
 
     def _generate_diffusion_schedule(self, s=0.008):
         # type: (float) -> np.ndarray
@@ -282,12 +285,30 @@ class GaussianDiffusion(nn.Module):
         out = a.gather(-1, ts)
         return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-    def remove_noise(self, xt, pred_noise, ts):
+    @torch.no_grad()
+    def remove_noise(self, xt, pred_noise, ts, inference=False):
         coef1 = self.extract(self.reciprocal_sqrt_alphas, ts, xt.shape)
         coef2 = self.extract(self.betas / self.sqrt_one_minus_alphas_cumprod, ts, xt.shape)
-        x_prev = coef1 * (xt - coef2 * pred_noise)
+        mean = coef1 * (xt - coef2 * pred_noise)
+
+        if inference:
+            # Compute variance
+            log_variance = self.extract(self.posterior_log_variance_clipped, ts, xt.shape)
+
+            if ts[0] > 0:
+                noise = torch.randn_like(xt)
+            else:
+                noise = torch.zeros_like(xt)
+
+            # Sample x_prev
+            x_prev = mean + noise * torch.exp(0.5 * log_variance)
+
+        else:
+            x_prev = mean
+
         return x_prev
 
+    @torch.no_grad()
     def add_noise(self, x, ts, noise):
         return (
             self.extract(self.sqrt_alphas_cumprod, ts, x.shape) * x +
@@ -320,7 +341,10 @@ class NoiseDecoder(nn.Module):
             num_heads=config.head_num
         )
 
-        self.fin = nn.Linear(config.hidden_dim, output_dim)
+        self.fin = nn.Sequential(
+            nn.Linear(config.hidden_dim, output_dim),
+            nn.Tanh()
+        )
   
     def forward(self, xcur, xnext, st_latent, lt_latent):
         # type: (Label, Label, Seq1st, Seq1st) -> Label
@@ -439,12 +463,7 @@ class SpeechToExpressionModel(pl.LightningModule):
                     global_frame_masks
                 )
 
-                x = self.diffusion.remove_noise(x, pred_noise, ts)
-
-                # if t > 0:
-                #     # Optionally add noise based on the sampling strategy
-                #     noise = torch.randn_like(x)
-                #     x = x + self.diffusion.get_noise_level(ts, x.shape) * noise
+                x = self.diffusion.remove_noise(x, pred_noise, ts, inference=True)
 
             return x
 
@@ -471,7 +490,7 @@ class SpeechToExpressionModel(pl.LightningModule):
                 global_frame_masks
             )
 
-            return pred_noise, noise, input_ts
+            return pred_noise, noise, perturbed_x
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -498,7 +517,7 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        pred_noise, noise, input_ts = self(
+        pred_noise, noise, perturbed_x = self(
             input_last_x,
             frame_features,
             global_frame_features,
@@ -508,8 +527,19 @@ class SpeechToExpressionModel(pl.LightningModule):
             current_long_frame
         )
 
-        loss = nn.functional.mse_loss(pred_noise, noise)
+        scaled_noise = torch.tanh(noise)
+
+        loss = nn.functional.mse_loss(pred_noise, scaled_noise)
         self.log("train_loss", loss)
+
+        if batch_idx % 100 == 0:  # Adjust the logging frequency as needed
+            global_step = self.current_epoch * self.trainer.num_training_batches + batch_idx
+
+            # Log histograms to TensorBoard
+            self.logger.experiment.add_histogram('perturbed_x', perturbed_x, global_step)
+            self.logger.experiment.add_histogram('noise', noise, global_step)
+            self.logger.experiment.add_histogram('pred_noise', pred_noise, global_step)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -533,7 +563,7 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        outputs, noise, input_ts = self(
+        pred_noise, noise, input_ts = self(
             input_last_x,
             frame_features,
             global_frame_features,
@@ -543,8 +573,10 @@ class SpeechToExpressionModel(pl.LightningModule):
             current_long_frame
         )
 
-        labels = labels.expand(outputs.shape[0], -1)
-        val_loss = nn.functional.mse_loss(outputs, labels)
+        val_loss = nn.functional.mse_loss(pred_noise, noise)
+
+        # labels = labels.expand(outputs.shape[0], -1)
+        # val_loss = nn.functional.mse_loss(outputs, labels)
         self.log("val_loss", val_loss)
 
     def configure_optimizers(self):
