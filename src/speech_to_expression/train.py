@@ -75,36 +75,41 @@ def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
 
-    # divisible_by_768 = [i for i in range(1, 129) if 768 % i == 0]
-    stm_prev_window = 3
-    stm_next_window = 6
-    ltm_prev_window = 90
-    ltm_next_window = 90
+    time_embed_dim = 100
+    # divisible_by_768 = [i for i in range(1, 32) if 768 % i == 0]
 
     # Suggest hyperparameters to tune
-    hparams = HyperParameters(
-        embed_dim = WAV2VEC2_EMBED_DIM,
-        output_dim = FACIAL_FEATURE_DIM,
-        # lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
-        lr = 0.00002,
-
-        stm_prev_window = stm_prev_window,
-        stm_next_window = stm_next_window,
-        ltm_prev_window = ltm_prev_window,
-        ltm_next_window = ltm_next_window,
-
-        stm_heads = trial.suggest_categorical("stm_heads", [4, 16, 48, 64, 96, 128]),
-
-        # LongTermTemporalModule
-        ltm_heads = trial.suggest_categorical("ltm_heads", [4, 16, 64, 96, 128]),
-        ltm_layers = trial.suggest_int("ltm_layers", 2, 6),
-
-        # BiasedConditionalSelfAttention
-        attn_heads = trial.suggest_categorical("attn_heads", [1, 2, 3, 4, 6, 8, 48]),
-        attn_layers = trial.suggest_int("attn_layers", 1, 10),
-
-        # MultiFrameAttentionAggregator
-        agg_heads = trial.suggest_categorical("agg_heads", [1, 2, 3, 4, 6, 8, 16]),
+    hparams = config.SpeechToExpressionConfig(
+        model="speech_to_expression",
+        embed_dim=WAV2VEC2_EMBED_DIM,
+        time_embed_dim=time_embed_dim,
+        output_dim=FACIAL_FEATURE_DIM,
+        lr = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
+        st=config.ShortTermConfig(
+            prev_window=trial.suggest_int("st_prev_window", 1, 10),
+            next_window=trial.suggest_int("st_next_window", 1, 10),
+            head_num=2,
+        ),
+        lt=config.LongTermConfig(
+            prev_window=trial.suggest_int("lt_prev_window", 1, 200),
+            next_window=trial.suggest_int("lt_next_window", 1, 200),
+            head_num=2,
+            layer_num=trial.suggest_int("lt_layer_num", 1, 8),
+        ),
+        diffusion=config.DiffusionConfig(
+            model="ddpm",
+            sample_mode="ancestral",
+            estimate_mode="reverse",
+            loss_type="l1",
+            noise_schedule_mode="linear",
+            noise_decoder_config=config.NoiseDecoderConfig(
+                head_num=16,
+                hidden_dim=1024,
+                layer_num=trial.suggest_int("noise_layer_num", 1, 20),
+                norm_type="layer_norm",
+            ),
+            train_timesteps_num=1000,
+        ),
     )
     
     # Pass the suggested hyperparameters into your model
@@ -127,10 +132,10 @@ def objective(trial):
     args = parse_args()
     train_loader, val_loader = prepare_dataloaders(
         args.hdf5_file,
-        stm_prev_window,
-        stm_next_window,
-        ltm_prev_window,
-        ltm_next_window,
+        hparams.st.prev_window,
+        hparams.st.next_window,
+        hparams.lt.prev_window,
+        hparams.lt.next_window,
         batch_size,
         
     )
@@ -290,8 +295,8 @@ def main():
         # Optimize hyperparameters using Optuna
         study = optuna.create_study(
             direction="minimize",
-            storage="sqlite:///optuna.db",
-            study_name="speech_to_expression_b1",
+            storage="sqlite:///optuna2.db",
+            study_name="speech_to_expression_b2",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)
@@ -329,7 +334,7 @@ def main():
                 noise_decoder_config=config.NoiseDecoderConfig(
                     head_num=16,
                     hidden_dim=1024,
-                    layer_num=15,
+                    layer_num=20,
                     norm_type="layer_norm",
                 ),
                 train_timesteps_num=1000,

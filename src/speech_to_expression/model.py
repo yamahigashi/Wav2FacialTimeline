@@ -207,28 +207,52 @@ class NoiseDecoder(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.query_proj = nn.Linear(output_dim * 2, config.hidden_dim)
         self.kv_proj = nn.Linear(embed_dim, config.hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            config.hidden_dim,
-            num_heads=config.head_num
+
+        # Define the Transformer encoder layer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=config.head_num,
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config.layer_num
         )
 
         self.fin = nn.Linear(config.hidden_dim, output_dim)
-  
+
     def forward(self, xcur, xnext, st_latent, lt_latent):
         # type: (Label, Label, FeatSeq1st, FeatSeq1st) -> Label
 
-        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # type: FeatSeq1st
+        # Concatenate and project the temporal features
+        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # (seq_len, batch_size, embed_dim)
+        proj_features = self.kv_proj(temporal_features)  # (seq_len, batch_size, hidden_dim)
 
+        # Concatenate and project the queries
         queries = torch.cat([xcur, xnext], dim=-1).unsqueeze(0).float()  # (1, batch_size, 2*output_dim)
         proj_queries = self.query_proj(queries)  # (1, batch_size, hidden_dim)
-        proj_kv = self.kv_proj(temporal_features)  # (seq_len, batch_size, hidden_dim)
 
-        attn_output, _ = self.cross_attn(proj_queries, proj_kv, proj_kv)
+        # Combine queries and features into a single sequence
+        combined_input = torch.cat([proj_queries, proj_features], dim=0)  # (seq_len + 1, batch_size, hidden_dim)
 
-        x = attn_output.squeeze(0)
-        x = self.fin(x)
+        # Create an attention mask to prevent temporal features from attending to the query
+        seq_len = proj_features.shape[0]
+        L = seq_len + 1  # Total sequence length
+        attention_mask = torch.zeros(L, L).bool()
+        attention_mask[1:, 0] = True  # Mask attention from temporal features to query
 
-        return x 
+        # Pass through the Transformer encoder
+        transformer_output = self.transformer(
+            combined_input,
+            mask=attention_mask.to(combined_input.device)
+        )  # (seq_len + 1, batch_size, hidden_dim)
+
+        query_output = transformer_output[0]  # (batch_size, hidden_dim)
+
+        # Final linear layer to get the output
+        x = self.fin(query_output)  # (batch_size, output_dim)
+
+        return x
 
 
 class GaussianDiffusion(pl.LightningModule):
