@@ -2,13 +2,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
+import diffusers.schedulers
 
 import config as conf
 
 import typing
 if typing.TYPE_CHECKING:
     from typing import (
-        Tuple  # noqa: F401
+        Tuple,  # noqa: F401
+        Optional,  # noqa: F401
     )
     from jaxtyping import (
         Float,  # noqa: F401
@@ -20,8 +22,10 @@ if typing.TYPE_CHECKING:
     )
 
     Label = Float[Array, "batch_size", "output_dim"]
-    Seq1st = Float[Array, "seq_len", "batch", "embed_dim"]
-    Batch1st = Float[Array, "batch", "seq_len", "embed_dim"]
+    FeatSeq1st = Float[Array, "seq_len", "batch", "embed_dim"]
+    FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
+    MaskSeq1st = Float[Array, "seq_len", "batch"]
+    MaskBatch1st = Float[Array, "batch", "seq_len"]
 
 
 class ShortTermTemporalModule(nn.Module):
@@ -40,7 +44,7 @@ class ShortTermTemporalModule(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, frame_features, key_padding_mask, timestep_emb):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"], Float[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+        # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
         """Forward pass of the ShortTermTemporalModule
 
         Args:
@@ -79,7 +83,7 @@ class LongTermTemporalModule(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, global_frame_features, src_key_padding_mask, timestep_emb):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Float[Array, "batch", "seq_len"], Float[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+        # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
         """Forward pass of the LongTermTemporalModule
 
         The input features should be in the sequence-first format, Transfomer expects the input to be
@@ -144,7 +148,7 @@ class PositionalEncoding(pl.LightningModule):
         return relative_positions
 
     def forward(self, x, current_frame_idx):
-        # type: (Float[Array, "seq_len", "batch", "embed_dim"], Int[Array, "batch"]) -> Float[Array, "seq_len", "batch", "embed_dim"]
+        # type: (FeatSeq1st, Int[Array, "batch"]) -> FeatSeq1st
         """
         Forward pass for combined relative positional encoding and temporal encoding.
         
@@ -193,139 +197,6 @@ class PositionalEncoding(pl.LightningModule):
         return x
 
 
-class SiLU(nn.Module):
-
-    @staticmethod
-    def forward(x):
-        return x * torch.sigmoid(x)
-
-
-class GaussianDiffusion(nn.Module):
-    """Gaussian Diffusion model. Forwarding through the module returns diffusion reversal scalar loss tensor.
-    Input:
-        x: tensor of shape (N, img_channels, *img_size)
-        y: tensor of shape (N)
-    Output:
-        scalar loss tensor
-    """
-    def __init__(
-        self,
-        config: conf.DiffusionConfig,
-        embed_dim: int,
-        output_dim: int,
-        time_embed_dim: int,
-        short_term_module: ShortTermTemporalModule,
-        long_term_module: LongTermTemporalModule,
-        st_window: int,
-        lt_window: int
-    ):
-
-        super().__init__()
-
-        self.time_step_num = config.time_step_num
-        self.time_embed_dim = time_embed_dim
-        self.estimate_mode = config.estimate_mode
-
-        self.timestep_embedding = nn.Embedding(self.time_step_num + 1, self.time_embed_dim)
-        self.short_term_module = short_term_module
-        self.long_term_module = long_term_module
-
-        self.model = NoiseDecoder(
-            config.noise_decorder_config,
-            output_dim,
-            st_window + lt_window,
-            embed_dim + time_embed_dim,
-        )
-
-        betas = self._generate_diffusion_schedule()
-        alphas = 1. - betas
-        alphas_cumprod = np.cumprod(alphas)
-        alphas_cumprod_prev = np.concatenate(([1.0], alphas_cumprod[:-1]))
-
-        # Compute the sigma for each timestep
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-        # For t=0, posterior_variance is set to a small value to prevent division by zero
-        posterior_variance = np.append(posterior_variance, [1e-20])
-
-        self.register_buffer("betas", torch.tensor(betas))
-        self.register_buffer("alphas", torch.tensor(alphas))
-        self.register_buffer("alphas_cumprod", torch.tensor(alphas_cumprod))
-
-        self.register_buffer("sqrt_alphas_cumprod", torch.tensor(np.sqrt(alphas_cumprod)))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.tensor(np.sqrt(1. - alphas_cumprod)))
-        self.register_buffer("reciprocal_sqrt_alphas", torch.tensor(np.sqrt(1. / alphas)))
-
-        self.register_buffer("posterior_variance", torch.tensor(posterior_variance))
-        self.register_buffer("posterior_log_variance_clipped", torch.log(torch.clamp(torch.tensor(posterior_variance), min=1e-20)))
-
-    def _generate_diffusion_schedule(self, s=0.008):
-        # type: (float) -> np.ndarray
-
-        def f(t, T):
-            # type: (int, int) -> float
-            return (np.cos((t / T + s) / (1 + s) * np.pi / 2)) ** 2
-
-        # Cosine schedule for beta
-        # from https://arxiv.org/abs/2102.09672  
-        alphas = []
-        f0 = f(0, self.time_step_num)
-
-        for t in range(self.time_step_num + 1):
-            alphas.append(f(t, self.time_step_num) / f0)
-        
-        betas = []
-
-        for t in range(1, self.time_step_num + 1):
-            betas.append(min(1 - alphas[t] / alphas[t - 1], 0.999))
-        return np.array(betas)
-
-    @torch.no_grad()
-    def extract(self, a, ts, x_shape):
-        b, *_ = ts.shape
-        out = a.gather(-1, ts)
-        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-    @torch.no_grad()
-    def remove_noise(self, xt, pred_noise, ts, inference=False):
-        coef1 = self.extract(self.reciprocal_sqrt_alphas, ts, xt.shape)
-        coef2 = self.extract(self.betas / self.sqrt_one_minus_alphas_cumprod, ts, xt.shape)
-        mean = coef1 * (xt - coef2 * pred_noise)
-
-        if inference:
-            # Compute variance
-            log_variance = self.extract(self.posterior_log_variance_clipped, ts, xt.shape)
-
-            if ts[0] > 0:
-                noise = torch.randn_like(xt)
-            else:
-                noise = torch.zeros_like(xt)
-
-            # Sample x_prev
-            x_prev = mean + noise * torch.exp(0.5 * log_variance)
-
-        else:
-            x_prev = mean
-
-        return x_prev
-
-    @torch.no_grad()
-    def add_noise(self, x, ts, noise):
-        return (
-            self.extract(self.sqrt_alphas_cumprod, ts, x.shape) * x +
-            self.extract(self.sqrt_one_minus_alphas_cumprod, ts, x.shape) * noise
-        )   
-
-    def forward(self, cur_x, next_x, ts, st_features, lt_features, key_padding_mask, global_key_padding_mask):
-
-        timestep_emb = self.timestep_embedding(ts)
-        st_latent = self.short_term_module(st_features, key_padding_mask, timestep_emb)
-        lt_latent = self.long_term_module(lt_features, global_key_padding_mask, timestep_emb)
-
-        estimated = self.model(cur_x, next_x, st_latent, lt_latent)
-
-        return estimated
-
-
 class NoiseDecoder(nn.Module):
 
     def __init__(self, config, output_dim, window_size, embed_dim):
@@ -341,15 +212,12 @@ class NoiseDecoder(nn.Module):
             num_heads=config.head_num
         )
 
-        self.fin = nn.Sequential(
-            nn.Linear(config.hidden_dim, output_dim),
-            nn.Tanh()
-        )
+        self.fin = nn.Linear(config.hidden_dim, output_dim)
   
     def forward(self, xcur, xnext, st_latent, lt_latent):
-        # type: (Label, Label, Seq1st, Seq1st) -> Label
+        # type: (Label, Label, FeatSeq1st, FeatSeq1st) -> Label
 
-        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # type: Seq1st
+        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # type: FeatSeq1st
 
         queries = torch.cat([xcur, xnext], dim=-1).unsqueeze(0).float()  # (1, batch_size, 2*output_dim)
         proj_queries = self.query_proj(queries)  # (1, batch_size, hidden_dim)
@@ -361,6 +229,60 @@ class NoiseDecoder(nn.Module):
         x = self.fin(x)
 
         return x 
+
+
+class GaussianDiffusion(pl.LightningModule):
+    """Gaussian Diffusion model. Forwarding through the module returns diffusion reversal scalar loss tensor.
+    Input:
+        x: tensor of shape (N, img_channels, *img_size)
+        y: tensor of shape (N)
+    Output:
+        scalar loss tensor
+    """
+    def __init__(
+        self,
+        config: conf.DiffusionConfig,
+        embed_dim: int,
+        output_dim: int,
+        time_embed_dim: int,
+        short_term_module: ShortTermTemporalModule,
+        long_term_module: LongTermTemporalModule,
+        noise_decoder_module: NoiseDecoder,
+        train: bool = True,
+    ):
+
+        super().__init__()
+
+        self.train_timesteps_num = config.train_timesteps_num
+        self.time_embed_dim = time_embed_dim
+        self.estimate_mode = config.estimate_mode
+
+        self.timestep_embedding = nn.Embedding(self.train_timesteps_num, self.time_embed_dim)
+        self.short_term_module = short_term_module
+        self.long_term_module = long_term_module
+
+        self.model = noise_decoder_module
+        self.estimate_mode = config.estimate_mode
+
+        self.scheduler = diffusers.schedulers.DDPMScheduler(
+            num_train_timesteps=config.train_timesteps_num,
+            variance_type="fixed_large",
+            clip_sample=False,
+            timestep_spacing="trailing",
+        )
+
+    def forward(self, cur_x, next_x, ts, st_features, lt_features, key_padding_mask, global_key_padding_mask):
+        # type: (Label, Label, Int[Array, "batch"], FeatSeq1st, FeatSeq1st, MaskBatch1st, MaskBatch1st) -> Label
+     
+        # Ensure ts is within the valid range
+        assert ts.max() < self.train_timesteps_num, "ts contains indices out of bounds for the embedding layer."
+        timestep_emb = self.timestep_embedding(ts)
+        st_latent = self.short_term_module(st_features, key_padding_mask, timestep_emb)
+        lt_latent = self.long_term_module(lt_features, global_key_padding_mask, timestep_emb)
+
+        estimated = self.model(cur_x, next_x, st_latent, lt_latent)
+
+        return estimated
 
 
 class SpeechToExpressionModel(pl.LightningModule):
@@ -388,6 +310,12 @@ class SpeechToExpressionModel(pl.LightningModule):
         embed_dim = config.embed_dim + config.time_embed_dim
         self.short_term_module = ShortTermTemporalModule(embed_dim, config.st.head_num)
         self.long_term_module = LongTermTemporalModule(embed_dim, config.lt.head_num, config.lt.layer_num)
+        self.noise_decoder_module = NoiseDecoder(
+            config.diffusion.noise_decoder_config,
+            config.output_dim,
+            short_term_window + long_term_window,
+            embed_dim,
+        )
 
         self.diffusion = GaussianDiffusion(
             config.diffusion,
@@ -396,8 +324,7 @@ class SpeechToExpressionModel(pl.LightningModule):
             config.time_embed_dim,
             self.short_term_module,
             self.long_term_module,
-            short_term_window,
-            long_term_window
+            self.noise_decoder_module,
         )
 
         self.lr = config.lr
@@ -416,9 +343,11 @@ class SpeechToExpressionModel(pl.LightningModule):
         current_short_frame,
         current_long_frame,
         input_ts=None,
-        inference=False
+        inference=False,
+        labels=None,
+        num_inference_steps=20,
     ):
-        # type: (Label, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int|None, bool) -> torch.Tensor|Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], Int[Array, "batch"], bool, Label, int) -> Label
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -450,47 +379,37 @@ class SpeechToExpressionModel(pl.LightningModule):
         if inference:
 
             x = torch.randn_like(input_last_x)  # Start from pure noise
-            for t in reversed(range(self.diffusion.time_step_num)):
-                ts = torch.full((batch_size,), t, device=x.device, dtype=torch.long)
+            self.diffusion.scheduler.set_timesteps(
+                num_inference_steps,
+                device=frame_features.device
+            )
 
-                pred_noise = self.diffusion(
+            for t in self.diffusion.scheduler.timesteps:
+                t = t.to(frame_features.device)
+                t = t.expand(batch_size)
+
+                # 1. predict noise model_output
+                model_output = self.diffusion(
                     input_last_x,
-                    x,
-                    ts,
+                    x.to(frame_features.device),
+                    t,
                     st_encoded,
                     lt_encoded,
                     frame_masks,
                     global_frame_masks
                 )
 
-                x = self.diffusion.remove_noise(x, pred_noise, ts, inference=True)
+                # 2. compute previous image: x_t -> x_t-1
+                x = self.diffusion.scheduler.step(
+                    model_output.to(self.diffusion.scheduler.alphas_cumprod.device),
+                    t.to(self.diffusion.scheduler.alphas_cumprod.device),
+                    x.to(self.diffusion.scheduler.alphas_cumprod.device)
+                ).prev_sample
 
             return x
 
         else:
-            if input_ts is None:
-                input_ts = torch.randint(
-                    0,
-                    self.diffusion.time_step_num,
-                    (batch_size,),
-                    device=frame_features.device
-                )
-
-            noise = torch.randn_like(input_last_x)
-            perturbed_x = self.diffusion.add_noise(input_last_x, input_ts, noise)
-
-            # Model predicts the noise
-            pred_noise = self.diffusion(
-                input_last_x,
-                perturbed_x,
-                input_ts,
-                st_encoded,
-                lt_encoded,
-                frame_masks,
-                global_frame_masks
-            )
-
-            return pred_noise, noise, perturbed_x
+            raise NotImplementedError("Training mode not implemented yet")
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -517,29 +436,38 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        pred_noise, noise, perturbed_x = self(
-            input_last_x,
-            frame_features,
-            global_frame_features,
-            frame_masks,
-            global_frame_masks,
-            current_short_frame,
-            current_long_frame
+        batch_size, _, embed_dim = frame_features.size()
+
+        # Permute the input features to the correct shape
+        # The nn.Transformer expects the input to be sequence-first data. Then,
+        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
+        frame_features = frame_features.permute(1, 0, 2)
+        global_frame_features = global_frame_features.permute(1, 0, 2)
+
+        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
+        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
+
+        noise = torch.randn_like(labels)
+        steps = torch.randint(
+            self.diffusion.scheduler.config.num_train_timesteps,
+            (input_last_x.size(0),),
+            device=frame_features.device
         )
 
-        scaled_noise = torch.tanh(noise)
+        noisy_x = self.diffusion.scheduler.add_noise(labels, noise, steps)
+        residual = self.diffusion(
+            input_last_x,
+            noisy_x,
+            steps,
+            st_encoded,
+            lt_encoded,
+            frame_masks,
+            global_frame_masks
+        )
 
-        loss = nn.functional.mse_loss(pred_noise, scaled_noise)
-        self.log("train_loss", loss)
+        loss = torch.nn.functional.mse_loss(residual, noise)
 
-        if batch_idx % 100 == 0:  # Adjust the logging frequency as needed
-            global_step = self.current_epoch * self.trainer.num_training_batches + batch_idx
-
-            # Log histograms to TensorBoard
-            self.logger.experiment.add_histogram('perturbed_x', perturbed_x, global_step)
-            self.logger.experiment.add_histogram('noise', noise, global_step)
-            self.logger.experiment.add_histogram('pred_noise', pred_noise, global_step)
-
+        self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -563,28 +491,42 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        pred_noise, noise, input_ts = self(
-            input_last_x,
-            frame_features,
-            global_frame_features,
-            frame_masks,
-            global_frame_masks,
-            current_short_frame,
-            current_long_frame
+        batch_size, _, embed_dim = frame_features.size()
+
+        # Permute the input features to the correct shape
+        # The nn.Transformer expects the input to be sequence-first data. Then,
+        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
+        frame_features = frame_features.permute(1, 0, 2)
+        global_frame_features = global_frame_features.permute(1, 0, 2)
+
+        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
+        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
+
+        noise = torch.randn_like(labels)
+        steps = torch.randint(
+            self.diffusion.scheduler.config.num_train_timesteps,
+            (input_last_x.size(0),),
+            device=frame_features.device
         )
 
-        val_loss = nn.functional.mse_loss(pred_noise, noise)
+        noisy_x = self.diffusion.scheduler.add_noise(labels, noise, steps)
+        residual = self.diffusion(
+            input_last_x,
+            noisy_x,
+            steps,
+            st_encoded,
+            lt_encoded,
+            frame_masks,
+            global_frame_masks
+        )
 
+        val_loss = torch.nn.functional.mse_loss(residual, noise)
         # labels = labels.expand(outputs.shape[0], -1)
         # val_loss = nn.functional.mse_loss(outputs, labels)
         self.log("val_loss", val_loss)
 
     def configure_optimizers(self):
-        # type: () -> torch.optim.Optimizer
-        """Configure the optimizer for training the model.
-        Adam optimizer is used with the specified learning rate.
-
-        Returns:
-            torch.optim.Optimizer: The optimizer for training the model
-        """
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        # type: () -> Tuple[list[torch.optim.Optimizer], list[torch.optim.lr_scheduler._LRScheduler]]
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
+        return [optimizer], [scheduler]

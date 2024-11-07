@@ -317,8 +317,8 @@ def main():
             lt=config.LongTermConfig(
                 prev_window=90,
                 next_window=60,
-                head_num=4,
-                layer_num=4,
+                head_num=2,
+                layer_num=3,
             ),
             diffusion=config.DiffusionConfig(
                 model="ddpm",
@@ -326,14 +326,13 @@ def main():
                 estimate_mode="reverse",
                 loss_type="l1",
                 noise_schedule_mode="linear",
-                noise_decorder_config=config.NoiseDecoderConfig(
-                    head_num=8,
+                noise_decoder_config=config.NoiseDecoderConfig(
+                    head_num=16,
                     hidden_dim=1024,
                     layer_num=15,
-                    activation="SiLU",
                     norm_type="layer_norm",
                 ),
-                time_step_num=20,
+                train_timesteps_num=1000,
             ),
         )
 
@@ -356,7 +355,7 @@ def main():
         model = SpeechToExpressionModel(hparams)
 
     # Set up logging using TensorBoard
-    log_dir = pathlib.Path(__file__).parent.parent / "logs"
+    log_dir = pathlib.Path(__file__).parent.parent.parent / "logs"
     logger = TensorBoardLogger(log_dir.as_posix(), name="diffusion")
 
     # Set up checkpoints to save the best model

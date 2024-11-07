@@ -10,7 +10,6 @@ class NoiseDecoderConfig(BaseModel):
     head_num: int = 4
     hidden_dim: int = 1024
     layer_num: int = 15
-    activation: str = "SiLU"
     norm_type: str = "layer_norm"
 
 
@@ -21,8 +20,8 @@ class DiffusionConfig(BaseModel):
     estimate_mode: str
     loss_type: str
     noise_schedule_mode: str
-    noise_decorder_config: NoiseDecoderConfig
-    time_step_num: int = 20
+    noise_decoder_config: NoiseDecoderConfig
+    train_timesteps_num: int = 1000
 
 
 class ShortTermConfig(BaseModel):
@@ -37,7 +36,7 @@ class LongTermConfig(BaseModel):
     next_window: int = 60
 
     head_num: int = 2
-    layer_num: int = 2
+    layer_num: int = 3
 
 
 class SpeechToExpressionConfig(BaseModel):

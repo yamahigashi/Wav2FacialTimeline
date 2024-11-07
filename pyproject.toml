@@ -25,4 +25,5 @@ dependencies = [
   "h5py",
   "optuna",
   "pydantic",
+  "diffusers",
 ]
