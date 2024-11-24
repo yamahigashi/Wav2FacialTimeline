@@ -1,0 +1,26 @@
+SpeechToExpressionConfig:
+
+  model: "default_model"
+  embed_dim: 768
+  output_dim: 31
+  time_embed_dim: 512
+  lr: 1e-5
+
+  st:
+    prev_window: 5
+    next_window: 6
+    head_num: 8
+
+  lt:
+    prev_window: 60
+    next_window: 150
+    head_num: 16
+    layer_num: 8
+
+  # Diffusion
+  diffusion:
+    train_timesteps_num: 1000
+    noise_decoder_config:
+      head_num: 16
+      hidden_dim: 1024
+      layer_num: 1

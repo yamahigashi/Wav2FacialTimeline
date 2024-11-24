@@ -10,6 +10,7 @@ import typing
 if typing.TYPE_CHECKING:
     from typing import (
         Tuple,  # noqa: F401
+        Dict,  # noqa: F401
         Optional,  # noqa: F401
     )
     from jaxtyping import (
@@ -28,6 +29,31 @@ if typing.TYPE_CHECKING:
     MaskBatch1st = Float[Array, "batch", "seq_len"]
 
 
+def find_closest_divisible_num_heads(embed_dim, target_num_heads, max_heads=16):
+    # type: (int, int, int) -> int
+    """
+    embed_dimを割り切れる、target_num_headsに最も近いnum_headsを見つける関数。
+    
+    Args:
+        embed_dim (int): 埋め込みの次元数
+        target_num_heads (int): 目標のヘッド数
+        max_heads (int): 最大のヘッド数の制限（デフォルトは16）
+
+    Returns:
+        int: target_num_headsに最も近い割り切れるnum_headsの値
+    """
+    # 上限を制限して、1 から max_heads の範囲で割り切れる num_heads を探す
+    possible_heads = []
+    for num_heads in range(1, max_heads + 1):
+        if embed_dim % num_heads == 0:
+            possible_heads.append(num_heads)
+
+    # 最も target_num_heads に近い値を選択
+    closest_num_heads = min(possible_heads, key=lambda x: abs(x - target_num_heads))
+    
+    return closest_num_heads
+
+
 class ShortTermTemporalModule(nn.Module):
     """Short-term Temporal Module"""
 
@@ -36,31 +62,31 @@ class ShortTermTemporalModule(nn.Module):
         """Initialize the ShortTermTemporalModule
 
         Args:
-            embed_dim (int): The input feature dimension
+            embed_dim (int): The input feature dimension + the time embedding dimension
             num_heads (int): The number of heads in the multi-head attention
         """
         super(ShortTermTemporalModule, self).__init__()
+        num_heads = find_closest_divisible_num_heads(embed_dim, num_heads)
         self.attention = nn.MultiheadAttention(embed_dim, num_heads)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, frame_features, key_padding_mask, timestep_emb):
+    def forward(self, st_features, st_key_padding_mask, timestep_emb):
         # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
         """Forward pass of the ShortTermTemporalModule
 
         Args:
-            frame_features (torch.Tensor): The input frame features
+            st_features (torch.Tensor): The input frame features
         """
 
-        # TODO: this should be extracted from the input
-        seq_len, batch_size, _ = frame_features.size()
+        seq_len, batch_size, _ = st_features.size()
         timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
-        frame_features = torch.cat([frame_features, timestep_emb_expanded], dim=-1)
+        st_features = torch.cat([st_features, timestep_emb_expanded], dim=-1)
 
         attn_output, _ = self.attention(
-            frame_features, frame_features, frame_features,
-            key_padding_mask=key_padding_mask
+            st_features, st_features, st_features,
+            key_padding_mask=st_key_padding_mask
         )
-        output = self.layer_norm(frame_features + attn_output)
+        output = self.layer_norm(st_features + attn_output)
         return output
 
 
@@ -72,17 +98,18 @@ class LongTermTemporalModule(nn.Module):
         """Initialize the LongTermTemporalModule
 
         Args:
-            embed_dim (int): The input feature dimension
+            embed_dim (int): The input feature dimension + the time embedding dimension
             num_heads (int): The number of attention heads in the multi-head attention
             num_layers (int): The number of transformer encoder layers
         """
         super(LongTermTemporalModule, self).__init__()
 
+        num_heads = find_closest_divisible_num_heads(embed_dim, num_heads)
         self.encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
         self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, global_frame_features, src_key_padding_mask, timestep_emb):
+    def forward(self, lt_features, src_key_padding_mask, timestep_emb):
         # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
         """Forward pass of the LongTermTemporalModule
 
@@ -91,20 +118,19 @@ class LongTermTemporalModule(nn.Module):
         converted back to the batch-first format.
 
         Args:
-            global_frame_features (torch.Tensor): The input global frame features
+            lt_features (torch.Tensor): The input global frame features
             src_key_padding_mask (torch.Tensor): The key padding mask for the input features
 
         Returns:
             torch.Tensor: Output of the transformer encoder
         """
 
-        # TODO: this should be extracted from the input
-        seq_len, batch_size, _ = global_frame_features.size()
+        seq_len, batch_size, _ = lt_features.size()
         timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
-        global_frame_features = torch.cat([global_frame_features, timestep_emb_expanded], dim=-1)
+        lt_features = torch.cat([lt_features, timestep_emb_expanded], dim=-1)
 
         attn_output = self.transformer_encoder(
-            global_frame_features,
+            lt_features,
             src_key_padding_mask=src_key_padding_mask
         )
         
@@ -121,138 +147,130 @@ class PositionalEncoding(pl.LightningModule):
 
         super(PositionalEncoding, self).__init__()
 
-        # Embeddings layer for relative positional encoding
-        self.relative_position_embeddings = nn.Embedding(2 * max_len + 1, embed_dim)
+        # Absolute positional encoding using sine and cosine functions
+        pe = torch.zeros(max_len, embed_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / embed_dim))
+        pe[:, 0::2] = torch.sin(position * div_term)  # Even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # Odd indices
+        pe = pe.unsqueeze(1)  # (max_len, 1, embed_dim)
+        self.register_buffer("pe", pe)
 
-        # Embeddings layer for temporal encoding, 3 values: past, present, future
+        # Temporal encoding (1) for past, (2) for present, and (3) for future
         self.temporal_embeddings = nn.Embedding(3, embed_dim)
-
-        self.max_len = max_len
-        
-        # Precompute relative position matrix once (for fixed seq_len)
-        relative_positions = self._precompute_relative_positions(max_len)
-        self.register_buffer("relative_positions", relative_positions)
-       
-        # FIXME: This buffered tensor causes a CUDA RuntimeError:
-        # Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
-        # Precompute embeddings for these relative positions
-        # precomputed_relative_embeddings = self.relative_position_embeddings(self.relative_positions)
-        # self.register_buffer("precomputed_relative_embeddings", precomputed_relative_embeddings)
-
-    def _precompute_relative_positions(self, max_len):
-        """Precompute the relative positions matrix for fixed max_len."""
-        positions = torch.arange(max_len, dtype=torch.long)
-        relative_positions = positions.view(-1, 1) - positions.view(1, -1)
-        relative_positions += (max_len - 1)  # Shift to positive values
-
-        return relative_positions
 
     def forward(self, x, current_frame_idx):
         # type: (FeatSeq1st, Int[Array, "batch"]) -> FeatSeq1st
         """
-        Forward pass for combined relative positional encoding and temporal encoding.
-        
         Args:
-            x (torch.Tensor): Input tensor of shape (seq_len, batch_size, embed_dim)
-            current_frame_idx (int): The index of the current frame in the sequence (center of past and future).
-            
+            x (torch.Tensor): 入力テンソル（形状： (seq_len, batch_size, embed_dim)）
+            current_frame_idx (torch.Tensor): 各バッチの現在フレームのインデックス（形状： (batch_size,)）
+
         Returns:
-            torch.Tensor: The input tensor with relative positional encodings and temporal encodings added.
+            torch.Tensor: 位置エンコーディングと時間的エンコーディングが付加された入力テンソル
         """
         seq_len, batch_size, embed_dim = x.size()
+        device = x.device
 
-        # 1. Encode relative positions an truncate to the current sequence length
-        relative_position_encodings = self.relative_position_embeddings(self.relative_positions[:seq_len, :seq_len])
-        relative_position_encodings = relative_position_encodings.unsqueeze(1).expand(-1, batch_size, -1, -1)
-        relative_position_encodings = relative_position_encodings.sum(dim=2)
-        if seq_len > self.max_len:
-            # expand the relative position encodings to the current sequence length
-            relative_position_encodings = nn.functional.pad(
-                relative_position_encodings,
-                (0, 0, seq_len - self.max_len, 0),
-                mode="constant",
-            )
+        # Get the positional encoding
+        pe = self.pe[:seq_len, :].to(device)  # (seq_len, 1, embed_dim)
+        pe = pe.expand(-1, batch_size, -1)    # (seq_len, batch_size, embed_dim)
 
-        # 2. Encode temporal positions
-        temporal_indices = torch.zeros((seq_len, batch_size), device=x.device, dtype=torch.long)  # initialize temporal indices to 0 (current frame)
+        # Calculate the temporal indices
+        frame_indices = torch.arange(seq_len, device=device).unsqueeze(1)  # type: Int[Array, "seq_len", 1, "batch"]
+        frame_indices = frame_indices.expand(-1, batch_size)  # type: Int[Array, "seq_len", "batch", "embed_dim"]
+        current_frame_idx_expanded = current_frame_idx.unsqueeze(0).expand(seq_len, batch_size)
 
-        # Create a matrix representing the frame indices (seq_len, 1)
-        frame_index_matrix = torch.arange(seq_len, device=x.device).unsqueeze(1)  # type: Int[Array, "seq_len", 1]
-        
-        # Use broadcasting to compare with current_frame_idx and assign 0 (past) 1 (current) 2 (future)
-        past_mask = frame_index_matrix < current_frame_idx.unsqueeze(0)
-        current_mask = frame_index_matrix == current_frame_idx.unsqueeze(0)
-        future_mask = frame_index_matrix > current_frame_idx.unsqueeze(0)
-        
-        # Set past and future indices
-        temporal_indices[past_mask] = 0
-        temporal_indices[current_mask] = 1
-        temporal_indices[future_mask] = 2
-        # Retrieve temporal encodings based on temporal indices (seq_len, batch_size, embed_dim)
-        temporal_encoding = self.temporal_embeddings(temporal_indices)  # Temporal embeddings are looked up using batched indices
+        temporal_indices = torch.zeros((seq_len, batch_size), dtype=torch.long, device=device)
+        temporal_indices[frame_indices < current_frame_idx_expanded] = 0  # past
+        temporal_indices[frame_indices == current_frame_idx_expanded] = 1  # present
+        temporal_indices[frame_indices > current_frame_idx_expanded] = 2  # future
 
-        # 3. Combine relative position encodings and temporal encodings
-        x = x + temporal_encoding + relative_position_encodings
+        # Get the temporal embeddings
+        temporal_encodings = self.temporal_embeddings(temporal_indices)  # (seq_len, batch_size, embed_dim)
+
+        # Add the positional and temporal encodings
+        x = x + pe + temporal_encodings
 
         return x
 
 
 class NoiseDecoder(nn.Module):
 
-    def __init__(self, config, output_dim, window_size, embed_dim):
-        # type: (conf.NoiseDecoderConfig, int, int, int) -> None
+    def __init__(self, config, output_dim, embed_dim):
+        # type: (conf.NoiseDecoderConfig, int, int) -> None
 
         super().__init__()
-
         self.hidden_dim = config.hidden_dim
-        self.query_proj = nn.Linear(output_dim * 2, config.hidden_dim)
-        self.kv_proj = nn.Linear(embed_dim, config.hidden_dim)
+        num_heads = find_closest_divisible_num_heads(self.hidden_dim, config.head_num)
 
-        # Define the Transformer encoder layer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=config.head_num,
+        # Project input features to hidden dimensions
+        self.query_proj = nn.Linear(output_dim * 2, self.hidden_dim)
+        self.key_proj = nn.Linear(embed_dim, self.hidden_dim)
+        self.value_proj = nn.Linear(embed_dim, self.hidden_dim)
+
+        # Transformer decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            activation="relu"
         )
-
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer,
             num_layers=config.layer_num
         )
 
-        self.fin = nn.Linear(config.hidden_dim, output_dim)
+        # Output layer
+        self.output_layer = nn.Linear(self.hidden_dim, output_dim)
+
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(self.hidden_dim)
 
     def forward(self, xcur, xnext, st_latent, lt_latent):
-        # type: (Label, Label, FeatSeq1st, FeatSeq1st) -> Label
+        """
+        Args:
+            xcur (Tensor): Current noisy input (batch_size, output_dim)
+            xnext (Tensor): Next noisy input (batch_size, output_dim)
+            st_latent (Tensor): Short-term features (seq_len_s, batch_size, embed_dim)
+            lt_latent (Tensor): Long-term features (seq_len_l, batch_size, embed_dim)
+        
+        Returns:
+            Tensor: Estimated noise (batch_size, output_dim)
+        """
+        # Prepare queries
+        queries = torch.cat([xcur, xnext], dim=-1)  # (batch_size, output_dim * 2)
+        queries = self.query_proj(queries)          # (batch_size, hidden_dim)
+        queries = queries.unsqueeze(0)              # (1, batch_size, hidden_dim)
 
-        # Concatenate and project the temporal features
-        temporal_features = torch.cat([st_latent, lt_latent], dim=0)  # (seq_len, batch_size, embed_dim)
-        proj_features = self.kv_proj(temporal_features)  # (seq_len, batch_size, hidden_dim)
+        # Prepare keys and values
+        # Concatenate short-term and long-term features along the sequence dimension
+        kv_features = torch.cat([st_latent, lt_latent], dim=0)  # (seq_len, batch_size, embed_dim)
+        keys = self.key_proj(kv_features)    # (seq_len, batch_size, hidden_dim)
+        # values = self.value_proj(kv_features)  # (seq_len, batch_size, hidden_dim)
 
-        # Concatenate and project the queries
-        queries = torch.cat([xcur, xnext], dim=-1).unsqueeze(0).float()  # (1, batch_size, 2*output_dim)
-        proj_queries = self.query_proj(queries)  # (1, batch_size, hidden_dim)
+        # Transformer decoder expects target sequence first
+        # Since we have only one query, the target sequence length is 1
+        # The memory (keys and values) is the concatenated temporal features
 
-        # Combine queries and features into a single sequence
-        combined_input = torch.cat([proj_queries, proj_features], dim=0)  # (seq_len + 1, batch_size, hidden_dim)
+        # Pass through the Transformer decoder
+        decoder_output = self.transformer_decoder(
+            tgt=queries,
+            memory=keys,
+            tgt_mask=None,
+            memory_mask=None,
+            tgt_key_padding_mask=None,
+            memory_key_padding_mask=None  # You can provide masks if needed
+        )
 
-        # Create an attention mask to prevent temporal features from attending to the query
-        seq_len = proj_features.shape[0]
-        L = seq_len + 1  # Total sequence length
-        attention_mask = torch.zeros(L, L).bool()
-        attention_mask[1:, 0] = True  # Mask attention from temporal features to query
+        decoder_output = self.layer_norm(decoder_output)  # (1, batch_size, hidden_dim)
+        decoder_output = decoder_output.squeeze(0)        # (batch_size, hidden_dim)
 
-        # Pass through the Transformer encoder
-        transformer_output = self.transformer(
-            combined_input,
-            mask=attention_mask.to(combined_input.device)
-        )  # (seq_len + 1, batch_size, hidden_dim)
+        # Output layer
+        output = self.output_layer(decoder_output)  # (batch_size, output_dim)
 
-        query_output = transformer_output[0]  # (batch_size, hidden_dim)
-
-        # Final linear layer to get the output
-        x = self.fin(query_output)  # (batch_size, output_dim)
-
-        return x
+        return output
 
 
 class GaussianDiffusion(pl.LightningModule):
@@ -279,14 +297,12 @@ class GaussianDiffusion(pl.LightningModule):
 
         self.train_timesteps_num = config.train_timesteps_num
         self.time_embed_dim = time_embed_dim
-        self.estimate_mode = config.estimate_mode
 
         self.timestep_embedding = nn.Embedding(self.train_timesteps_num, self.time_embed_dim)
         self.short_term_module = short_term_module
         self.long_term_module = long_term_module
 
         self.model = noise_decoder_module
-        self.estimate_mode = config.estimate_mode
 
         self.scheduler = diffusers.schedulers.DDPMScheduler(
             num_train_timesteps=config.train_timesteps_num,
@@ -295,18 +311,71 @@ class GaussianDiffusion(pl.LightningModule):
             timestep_spacing="trailing",
         )
 
-    def forward(self, cur_x, next_x, ts, st_features, lt_features, key_padding_mask, global_key_padding_mask):
+    def forward(
+        self,
+        cur_x,
+        next_x,
+        ts,
+        st_features,
+        lt_features,
+        st_key_padding_mask,
+        lt_key_padding_mask
+    ):
         # type: (Label, Label, Int[Array, "batch"], FeatSeq1st, FeatSeq1st, MaskBatch1st, MaskBatch1st) -> Label
      
         # Ensure ts is within the valid range
         assert ts.max() < self.train_timesteps_num, "ts contains indices out of bounds for the embedding layer."
         timestep_emb = self.timestep_embedding(ts)
-        st_latent = self.short_term_module(st_features, key_padding_mask, timestep_emb)
-        lt_latent = self.long_term_module(lt_features, global_key_padding_mask, timestep_emb)
+        st_latent = self.short_term_module(st_features, st_key_padding_mask, timestep_emb)
+        lt_latent = self.long_term_module(lt_features, lt_key_padding_mask, timestep_emb)
 
         estimated = self.model(cur_x, next_x, st_latent, lt_latent)
 
         return estimated
+
+    def generate(
+        self,
+        input_last_x,
+        st_encoded,
+        lt_encoded,
+        frame_masks,
+        global_frame_masks,
+        current_short_frame,
+        current_long_frame,
+        num_inference_steps=30
+    ):
+        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], int) -> Label
+
+        batch_size = input_last_x.size(0)
+        device = input_last_x.device
+
+        # 推論用のスケジューラを設定
+        self.scheduler.set_timesteps(
+            num_inference_steps,
+            device=device
+        )
+
+        # 初期入力をノイズから開始
+        x = torch.randn_like(input_last_x).to(device)
+
+        for t in self.scheduler.timesteps:
+            ts = t.expand(batch_size).to(device)
+
+            timestep_emb = self.timestep_embedding(ts)
+            st_latent = self.short_term_module(st_encoded, frame_masks, timestep_emb)
+            lt_latent = self.long_term_module(lt_encoded, global_frame_masks, timestep_emb)
+
+            # ノイズの予測
+            model_output = self.model(input_last_x, x, st_latent, lt_latent)
+
+            # 前のサンプルを計算
+            x = self.scheduler.step(
+                model_output,
+                t,
+                x
+            ).prev_sample
+
+        return x
 
 
 class SpeechToExpressionModel(pl.LightningModule):
@@ -337,7 +406,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         self.noise_decoder_module = NoiseDecoder(
             config.diffusion.noise_decoder_config,
             config.output_dim,
-            short_term_window + long_term_window,
             embed_dim,
         )
 
@@ -353,25 +421,21 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         self.lr = config.lr
 
-        self.memory_weights = nn.Parameter(torch.ones(2))
-
         self.save_hyperparameters()
 
     def forward(
         self,
         input_last_x,
-        frame_features,
-        global_frame_features,
+        current_x,
+        ts,
+        st_features,
+        lt_features,
         frame_masks,
         global_frame_masks,
         current_short_frame,
         current_long_frame,
-        input_ts=None,
-        inference=False,
-        labels=None,
-        num_inference_steps=20,
     ):
-        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], Int[Array, "batch"], bool, Label, int) -> Label
+        # type: (Label, Label, int, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"]) -> Label
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -383,57 +447,106 @@ class SpeechToExpressionModel(pl.LightningModule):
         The bias factor in the biased conditional self-attention module is conditioned on the input condition.
 
         Args:
-            frame_features (torch.Tensor): The input frame features
-            global_frame_features (torch.Tensor): The input global frame features
+            st_features (torch.Tensor): The input frame features
+            lt_features (torch.Tensor): The input global frame features
 
         Returns:
             torch.Tensor: The output features
         """
-        batch_size, _, embed_dim = frame_features.size()
+        batch_size, _, embed_dim = st_features.size()
 
         # Permute the input features to the correct shape
         # The nn.Transformer expects the input to be sequence-first data. Then,
         # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
-        frame_features = frame_features.permute(1, 0, 2)
-        global_frame_features = global_frame_features.permute(1, 0, 2)
+        st_features = st_features.permute(1, 0, 2)
+        lt_features = lt_features.permute(1, 0, 2)
 
-        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
-        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
+        st_encoded = self.short_positional_encoding(st_features, current_short_frame)
+        lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
 
-        if inference:
+        estimated = self.diffusion(
+            input_last_x,
+            current_x,
+            ts,
+            st_encoded,
+            lt_encoded,
+            frame_masks,
+            global_frame_masks
+        )
 
-            x = torch.randn_like(input_last_x)  # Start from pure noise
-            self.diffusion.scheduler.set_timesteps(
-                num_inference_steps,
-                device=frame_features.device
-            )
+        return estimated
 
-            for t in self.diffusion.scheduler.timesteps:
-                t = t.to(frame_features.device)
-                t = t.expand(batch_size)
+    def generate(
+        self,
+        input_last_x,
+        st_features,
+        lt_features,
+        frame_masks,
+        global_frame_masks,
+        current_short_frame,
+        current_long_frame,
+        num_inference_steps=20,
+    ):
+        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], int) -> Label
 
-                # 1. predict noise model_output
-                model_output = self.diffusion(
-                    input_last_x,
-                    x.to(frame_features.device),
-                    t,
-                    st_encoded,
-                    lt_encoded,
-                    frame_masks,
-                    global_frame_masks
-                )
+        batch_size, _, embed_dim = st_features.size()
 
-                # 2. compute previous image: x_t -> x_t-1
-                x = self.diffusion.scheduler.step(
-                    model_output.to(self.diffusion.scheduler.alphas_cumprod.device),
-                    t.to(self.diffusion.scheduler.alphas_cumprod.device),
-                    x.to(self.diffusion.scheduler.alphas_cumprod.device)
-                ).prev_sample
+        # Permute the input features to the correct shape
+        # The nn.Transformer expects the input to be sequence-first data. Then,
+        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
+        st_features = st_features.permute(1, 0, 2)
+        lt_features = lt_features.permute(1, 0, 2)
 
-            return x
+        st_encoded = self.short_positional_encoding(st_features, current_short_frame)
+        lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
 
-        else:
-            raise NotImplementedError("Training mode not implemented yet")
+        generated_output = self.diffusion.generate(
+            input_last_x,
+            st_encoded,
+            lt_encoded,
+            frame_masks,
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
+            num_inference_steps
+        )
+        return generated_output
+
+    def custom_loss(self, pred_noise, noisy_x, noise, steps):
+        # type: (Label, Label, Label, Int[Array, "batch"]) -> torch.Tensor
+        """Custom loss function for the SpeechToExpressionModel
+
+        We already know that the labels have some constraints. We can use this information to
+        create a custom loss function.
+
+        The constraints are:
+            Range of [0:28] is 0 - 1.0
+            Sum of [21:28] is 1.0
+        """
+        loss_noisy = torch.nn.functional.mse_loss(pred_noise, noise)
+
+        # Calculate x0_pred
+        alpha_t = self.diffusion.scheduler.alphas_cumprod[steps].to(noisy_x.device).view(-1, 1)
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        x0_pred = (noisy_x - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+
+        # Condition 1: Range of [0:28] is 0 - 1.0
+        range_penalty = torch.relu(x0_pred[:, :28] - 1).mean() + torch.relu(-x0_pred[:, :28]).mean()
+
+        # Condition 2: Sum of [21:28] is 1.0
+        sum_constraint_penalty = torch.abs(x0_pred[:, 21:28].sum(dim=1) - 1).mean()
+
+        total_loss = (
+            loss_noisy +
+            0.2 * range_penalty +
+            0.2 * sum_constraint_penalty
+        )
+     
+        self.log("range_penalty", range_penalty)
+        self.log("sum_constraint_penalty", sum_constraint_penalty)
+
+        return total_loss
 
     def training_step(self, batch, batch_idx):
         # type: (Batch, int) -> torch.Tensor
@@ -451,8 +564,8 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         (
             input_last_x,
-            frame_features,
-            global_frame_features,
+            st_features,
+            lt_features,
             frame_masks,
             global_frame_masks,
             current_short_frame,
@@ -460,36 +573,33 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        batch_size, _, embed_dim = frame_features.size()
-
-        # Permute the input features to the correct shape
-        # The nn.Transformer expects the input to be sequence-first data. Then,
-        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
-        frame_features = frame_features.permute(1, 0, 2)
-        global_frame_features = global_frame_features.permute(1, 0, 2)
-
-        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
-        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
-
-        noise = torch.randn_like(labels)
+        device = st_features.device
+        noise = torch.randn_like(labels).to(device)
         steps = torch.randint(
+            0,
             self.diffusion.scheduler.config.num_train_timesteps,
             (input_last_x.size(0),),
-            device=frame_features.device
+            device=device
         )
 
+        # ノイズを加えたデータの生成
         noisy_x = self.diffusion.scheduler.add_noise(labels, noise, steps)
-        residual = self.diffusion(
+
+        # モデルの順伝播
+        residual = self(
             input_last_x,
             noisy_x,
             steps,
-            st_encoded,
-            lt_encoded,
+            st_features,
+            lt_features,
             frame_masks,
-            global_frame_masks
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
         )
 
-        loss = torch.nn.functional.mse_loss(residual, noise)
+        # 損失の計算
+        loss = self.custom_loss(residual, noisy_x, noise, steps)
 
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -506,8 +616,8 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         (
             input_last_x,
-            frame_features,
-            global_frame_features,
+            st_features,
+            lt_features,
             frame_masks,
             global_frame_masks,
             current_short_frame,
@@ -515,42 +625,38 @@ class SpeechToExpressionModel(pl.LightningModule):
             labels
         ) = batch
 
-        batch_size, _, embed_dim = frame_features.size()
-
-        # Permute the input features to the correct shape
-        # The nn.Transformer expects the input to be sequence-first data. Then,
-        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
-        frame_features = frame_features.permute(1, 0, 2)
-        global_frame_features = global_frame_features.permute(1, 0, 2)
-
-        st_encoded = self.short_positional_encoding(frame_features, current_short_frame)
-        lt_encoded = self.long_positional_encoding(global_frame_features, current_long_frame)
-
-        noise = torch.randn_like(labels)
+        device = st_features.device
+        noise = torch.randn_like(labels).to(device)
         steps = torch.randint(
+            0,
             self.diffusion.scheduler.config.num_train_timesteps,
             (input_last_x.size(0),),
-            device=frame_features.device
+            device=device
         )
 
         noisy_x = self.diffusion.scheduler.add_noise(labels, noise, steps)
-        residual = self.diffusion(
+
+        # モデルの順伝播
+        residual = self(
             input_last_x,
             noisy_x,
             steps,
-            st_encoded,
-            lt_encoded,
+            st_features,
+            lt_features,
             frame_masks,
-            global_frame_masks
+            global_frame_masks,
+            current_short_frame,
+            current_long_frame,
         )
 
-        val_loss = torch.nn.functional.mse_loss(residual, noise)
-        # labels = labels.expand(outputs.shape[0], -1)
-        # val_loss = nn.functional.mse_loss(outputs, labels)
+        val_loss = self.custom_loss(residual, noisy_x, noise, steps)
         self.log("val_loss", val_loss)
 
     def configure_optimizers(self):
-        # type: () -> Tuple[list[torch.optim.Optimizer], list[torch.optim.lr_scheduler._LRScheduler]]
+        # type: () -> Dict[str, torch.optim.Optimizer|torch.optim.lr_scheduler._LRScheduler]
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler,
+        }

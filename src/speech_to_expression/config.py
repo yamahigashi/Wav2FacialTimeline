@@ -1,4 +1,3 @@
-import os
 from pydantic import BaseModel, PositiveInt
 
 import typing
@@ -10,18 +9,14 @@ class NoiseDecoderConfig(BaseModel):
     head_num: int = 4
     hidden_dim: int = 1024
     layer_num: int = 15
-    norm_type: str = "layer_norm"
+    dim_feedforward: int = 4096
+    dropout: float = 0.1
 
 
 class DiffusionConfig(BaseModel):
 
-    model: str
-    sample_mode: str
-    estimate_mode: str
-    loss_type: str
-    noise_schedule_mode: str
-    noise_decoder_config: NoiseDecoderConfig
     train_timesteps_num: int = 1000
+    noise_decoder_config: NoiseDecoderConfig
 
 
 class ShortTermConfig(BaseModel):
@@ -55,4 +50,4 @@ def load_from_yaml(yaml_path: str):
     import yaml
     with open(yaml_path) as f:
         dat = yaml.safe_load(f)
-    return SpeechToExpressionConfig(**dat)
+    return SpeechToExpressionConfig(**dat.get("SpeechToExpressionConfig", {}))

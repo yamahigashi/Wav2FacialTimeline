@@ -160,7 +160,7 @@ def run_inference(
     current_long_frame = current_long_frame.to(device)
 
     with torch.no_grad():
-        output = model(
+        output = model.generate(
             last_x,
             frame_features,
             global_frame_features,
@@ -168,7 +168,6 @@ def run_inference(
             global_frame_masks,
             current_short_frame,
             current_long_frame,
-            inference=True
         )
     return output
 
@@ -266,7 +265,7 @@ def main():
             hparams
         )
 
-        # last_x = output
+        last_x = torch.tanh(output)
         res = output.cpu()
         results.append(res)
 
