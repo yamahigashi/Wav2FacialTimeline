@@ -105,7 +105,11 @@ class LongTermTemporalModule(nn.Module):
         super(LongTermTemporalModule, self).__init__()
 
         num_heads = find_closest_divisible_num_heads(embed_dim, num_heads)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            batch_first=True,
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
@@ -216,6 +220,8 @@ class NoiseDecoder(nn.Module):
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
             activation="relu"
+            activation="relu",
+            batch_first=True
         )
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer,
@@ -455,12 +461,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
         batch_size, _, embed_dim = st_features.size()
 
-        # Permute the input features to the correct shape
-        # The nn.Transformer expects the input to be sequence-first data. Then,
-        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
-        st_features = st_features.permute(1, 0, 2)
-        lt_features = lt_features.permute(1, 0, 2)
-
         st_encoded = self.short_positional_encoding(st_features, current_short_frame)
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
 
@@ -490,12 +490,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], int) -> Label
 
         batch_size, _, embed_dim = st_features.size()
-
-        # Permute the input features to the correct shape
-        # The nn.Transformer expects the input to be sequence-first data. Then,
-        # (batch_size, seq_len, embed_dim) -> （(sequence_length, batch_size, embed_dim)）
-        st_features = st_features.permute(1, 0, 2)
-        lt_features = lt_features.permute(1, 0, 2)
 
         st_encoded = self.short_positional_encoding(st_features, current_short_frame)
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
