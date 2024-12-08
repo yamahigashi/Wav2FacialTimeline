@@ -113,7 +113,10 @@ class LongTermTemporalModule(nn.Module):
             nhead=num_heads,
             batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, lt_features, src_key_padding_mask, timestep_emb):
@@ -358,19 +361,18 @@ class GaussianDiffusion(pl.LightningModule):
 
     def generate(
         self,
-        input_last_x,
+        past_frames,
         st_encoded,
         lt_encoded,
+        past_frame_masks,
         frame_masks,
         global_frame_masks,
         current_short_frame,
         current_long_frame,
         num_inference_steps=30
     ):
-        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], int) -> Label
-
-        batch_size = input_last_x.size(0)
-        device = input_last_x.device
+        batch_size = past_frames.size(0)
+        device = past_frames.device
 
         # 推論用のスケジューラを設定
         self.scheduler.set_timesteps(
@@ -379,7 +381,7 @@ class GaussianDiffusion(pl.LightningModule):
         )
 
         # 初期入力をノイズから開始
-        x = torch.randn_like(input_last_x).to(device)
+        x = torch.randn_like(past_frames[:, -1, :]).unsqueeze(1).to(device)
 
         for t in self.scheduler.timesteps:
             ts = t.expand(batch_size).to(device)
@@ -389,7 +391,13 @@ class GaussianDiffusion(pl.LightningModule):
             lt_latent = self.long_term_module(lt_encoded, global_frame_masks, timestep_emb)
 
             # ノイズの予測
-            model_output = self.model(input_last_x, x, st_latent, lt_latent)
+            model_output = self.model(
+                past_frames,
+                x,
+                st_latent,
+                lt_latent,
+                past_frame_masks
+            )
 
             # 前のサンプルを計算
             x = self.scheduler.step(
@@ -496,16 +504,16 @@ class SpeechToExpressionModel(pl.LightningModule):
 
     def generate(
         self,
-        input_last_x,
+        past_frames,
         st_features,
         lt_features,
+        past_frame_masks,
         frame_masks,
         global_frame_masks,
         current_short_frame,
         current_long_frame,
         num_inference_steps=20,
     ):
-        # type: (Label, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"], int) -> Label
 
         batch_size, _, embed_dim = st_features.size()
 
@@ -513,9 +521,10 @@ class SpeechToExpressionModel(pl.LightningModule):
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
 
         generated_output = self.diffusion.generate(
-            input_last_x,
+            past_frames,
             st_encoded,
             lt_encoded,
+            past_frame_masks,
             frame_masks,
             global_frame_masks,
             current_short_frame,

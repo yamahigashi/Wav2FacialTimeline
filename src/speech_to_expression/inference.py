@@ -43,8 +43,6 @@ def preprocess_inference_data(audio_path, hparams):
     # type: (str, dict) -> Generator
     """Preprocess input data for inference with batching."""
 
-    batch_size = 1  # Set the batch size to 1 for inference, for sequential processing for now
-
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
     wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
 
@@ -56,26 +54,11 @@ def preprocess_inference_data(audio_path, hparams):
 
     num_frames = audio_features.shape[0]
 
-    s_term_batch = []
-    l_term_batch = []
-    s_mask_batch = []
-    l_mask_batch = []
-    s_frame_batch = []
-    l_frame_batch = []
-
-    def clear_batch(stb, ltb, smb, lmb, sfb, lfb):
-        stb.clear()
-        ltb.clear()
-        smb.clear()
-        lmb.clear()
-        sfb.clear()
-        lfb.clear()
-
     for i in range(num_frames):
 
         (
             s_term_features,
-            l_term_frames,
+            l_term_features,
             s_frame_masks,
             l_frame_masks,
             current_s_frame,
@@ -83,36 +66,13 @@ def preprocess_inference_data(audio_path, hparams):
 
         ) = get_audio_feature_parameters(audio_features, i, hparams)
 
-        s_term_batch.append(s_term_features)
-        l_term_batch.append(l_term_frames)
-        s_mask_batch.append(s_frame_masks)
-        l_mask_batch.append(l_frame_masks)
-        s_frame_batch.append(current_s_frame)
-        l_frame_batch.append(current_l_frame)
-
-        if len(s_term_batch) % batch_size == 0:
-            # Pad sequences to the same length
-            padded_s_term_batch = pad_sequence(s_term_batch, batch_first=True)
-            padded_l_term_batch = pad_sequence(l_term_batch, batch_first=True)
-            padded_s_mask_batch = pad_sequence(s_mask_batch, batch_first=True)
-            padded_l_mask_batch = pad_sequence(l_mask_batch, batch_first=True)
-            s_frame = torch.stack(s_frame_batch)
-            l_frame = torch.stack(l_frame_batch)
-
-            yield padded_s_term_batch, padded_l_term_batch, padded_s_mask_batch, padded_l_mask_batch, s_frame, l_frame
-
-            # Reset batch lists
-            clear_batch(s_term_batch, l_term_batch, s_mask_batch, l_mask_batch, s_frame_batch, l_frame_batch)
-
-    # Yield any remaining data that didn't fill a complete batch
-    if s_term_batch:
-        padded_s_term_batch = pad_sequence(s_term_batch, batch_first=True)
-        padded_l_term_batch = pad_sequence(l_term_batch, batch_first=True)
-        padded_s_mask_batch = pad_sequence(s_mask_batch, batch_first=True)
-        padded_l_mask_batch = pad_sequence(l_mask_batch, batch_first=True)
-
-        s_frame = torch.stack(s_frame_batch)
-        l_frame = torch.stack(l_frame_batch)
+        # Pad sequences to the same length
+        padded_s_term_batch = pad_sequence([s_term_features], batch_first=True)
+        padded_l_term_batch = pad_sequence([l_term_features], batch_first=True)
+        padded_s_mask_batch = pad_sequence([s_frame_masks], batch_first=True)
+        padded_l_mask_batch = pad_sequence([l_frame_masks], batch_first=True)
+        s_frame = torch.stack([current_s_frame])
+        l_frame = torch.stack([current_l_frame])
 
         yield padded_s_term_batch, padded_l_term_batch, padded_s_mask_batch, padded_l_mask_batch, s_frame, l_frame
 
@@ -140,9 +100,10 @@ def get_audio_feature_parameters(audio_features, frame, hparams):
 
 def run_inference(
         model,
-        last_x,
+        past_frames,
         frame_features,
         global_frame_features,
+        past_frame_masks,
         frame_masks,
         global_frame_masks,
         current_short_frame,
@@ -152,8 +113,10 @@ def run_inference(
 ):
     """Run inference on the given data."""
 
+    past_frames = past_frames.to(device)
     frame_features = frame_features.to(device)
     global_frame_features = global_frame_features.to(device)
+    past_frame_masks = past_frame_masks.to(device)
     frame_masks = frame_masks.to(device)
     global_frame_masks = global_frame_masks.to(device)
     current_short_frame = current_short_frame.to(device)
@@ -161,14 +124,16 @@ def run_inference(
 
     with torch.no_grad():
         output = model.generate(
-            last_x,
+            past_frames,
             frame_features,
             global_frame_features,
+            past_frame_masks,
             frame_masks,
             global_frame_masks,
             current_short_frame,
             current_long_frame,
         )
+
     return output
 
 
@@ -180,6 +145,7 @@ def save_output(output, output_file_path):
 
 
 def save_output_to_csv(results, output_file_path):
+    # type: (list[np.ndarray], str) -> None
     """Save inference output to a CSV file using Pandas."""
 
     au_columns = [
@@ -224,7 +190,7 @@ def save_output_to_csv(results, output_file_path):
     columns = ["FaceScore"] + au_columns + emotion_columns + poses_columns
 
     # Convert the list of tensors into a flat list and then a DataFrame
-    flat_results = [np.round(tensor.numpy().flatten(), 3) for tensor in results]  # Flatten the tensors
+    flat_results = [np.round(res.flatten().tolist(), 3) for res in results]
     df = pd.DataFrame(flat_results, columns=columns)
 
     # Save the DataFrame to a CSV file
@@ -233,6 +199,8 @@ def save_output_to_csv(results, output_file_path):
 
 def main():
 
+    NUM_FRAMES = 50
+
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -240,8 +208,10 @@ def main():
     model, hparams = load_model(args.checkpoint, device)
 
     data_gen = preprocess_inference_data(args.input_file, hparams)
+    past_frames = torch.zeros(1, NUM_FRAMES, 31).to(device)
+    past_frame_masks = torch.ones(1, NUM_FRAMES).to(device)
+    past_frame_masks[:, -1] = 0  # unmask the first frame
 
-    last_x = torch.zeros(1, 31).to(device)
     for batch in tqdm(data_gen, desc="Processing frames"):
         (
             frame_features,
@@ -254,9 +224,10 @@ def main():
 
         output = run_inference(
             model,
-            last_x,
+            past_frames,
             frame_features,
             global_frame_features,
+            past_frame_masks,
             frame_masks,
             global_frame_masks,
             current_short_frame,
@@ -265,8 +236,12 @@ def main():
             hparams
         )
 
-        last_x = torch.tanh(output)
-        res = output.cpu()
+        past_frames = torch.cat([past_frames, output], dim=1)
+        past_frames = past_frames[:, 1:]
+        past_frame_masks = torch.cat([past_frame_masks, torch.zeros(1, 1).to(device)], dim=1)
+        past_frame_masks = past_frame_masks[:, 1:]
+
+        res = utils.reverse_mean_and_std_normalization(output)
         results.append(res)
 
     # Save or process the output
