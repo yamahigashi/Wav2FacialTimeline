@@ -105,8 +105,8 @@ class LongTermTemporalModule(nn.Module):
         super(LongTermTemporalModule, self).__init__()
 
         num_heads = find_closest_divisible_num_heads(embed_dim, num_heads)
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, lt_features, src_key_padding_mask, timestep_emb):
