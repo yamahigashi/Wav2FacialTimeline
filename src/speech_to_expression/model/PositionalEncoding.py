@@ -15,12 +15,11 @@ if typing.TYPE_CHECKING:
     )
     from dataset import (
         Batch,  # noqa: F401
+        PastFramesBatch,  # noqa: F401
+        FeatBatch, # noqa: F401
+        MaskBatch, # noqa: F401
+        LabelBatch, # noqa: F401
     )
-
-    Label = Float[Array, "batch_size", "output_dim"]
-    FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
-    MaskSeq1st = Float[Array, "seq_len", "batch"]
-    MaskBatch1st = Float[Array, "batch", "seq_len"]
 
 
 class PositionalEncoding(nn.Module):
@@ -46,7 +45,7 @@ class PositionalEncoding(nn.Module):
         self.temporal_embeddings = nn.Embedding(3, embed_dim)
 
     def forward(self, x, current_frame_idx):
-        # type: (torch.Tensor, torch.Tensor) -> torch.Tensor
+        # type: (FeatBatch, Int[Array, "batch"]) -> FeatBatch
         """
         Args:
             x (torch.Tensor): 入力テンソル（形状： (batch_size, seq_len, embed_dim)）

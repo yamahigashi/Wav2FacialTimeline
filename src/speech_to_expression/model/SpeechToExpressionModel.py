@@ -26,12 +26,13 @@ if typing.TYPE_CHECKING:
     )
     from dataset import (
         Batch,  # noqa: F401
+        PastFramesBatch,  # noqa: F401
+        FeatBatch, # noqa: F401
+        MaskBatch, # noqa: F401
+        LabelBatch, # noqa: F401
     )
-
-    Label = Float[Array, "batch_size", "output_dim"]
-    FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
-    MaskSeq1st = Float[Array, "seq_len", "batch"]
-    MaskBatch1st = Float[Array, "batch", "seq_len"]
+    TimeEmbed = Float[Array, "batch", "seq_len", "time_embed_dim"]
+    TS = Int[Array, "batch"]
 
 
 class SpeechToExpressionModel(pl.LightningModule):
@@ -92,6 +93,7 @@ class SpeechToExpressionModel(pl.LightningModule):
         current_short_frame,
         current_long_frame,
     ):
+        # type: (PastFramesBatch, LabelBatch, TS, FeatBatch, FeatBatch, MaskBatch, MaskBatch, MaskBatch, Float[Array, "batch"], Float[Array, "batch"]) -> LabelBatch
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -109,7 +111,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         Returns:
             torch.Tensor: The output features
         """
-        batch_size, _, embed_dim = st_features.size()
 
         st_encoded = self.short_positional_encoding(st_features, current_short_frame)
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
@@ -137,10 +138,9 @@ class SpeechToExpressionModel(pl.LightningModule):
         global_frame_masks,
         current_short_frame,
         current_long_frame,
-        num_inference_steps=20,
+        num_inference_steps=30,
     ):
-
-        batch_size, _, embed_dim = st_features.size()
+        # type: (PastFramesBatch, FeatBatch, FeatBatch, MaskBatch, MaskBatch, MaskBatch, Float[Array, "batch"], Float[Array, "batch"], int) -> LabelBatch
 
         st_encoded = self.short_positional_encoding(st_features, current_short_frame)
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
@@ -152,16 +152,20 @@ class SpeechToExpressionModel(pl.LightningModule):
             past_frame_masks,
             frame_masks,
             global_frame_masks,
-            current_short_frame,
-            current_long_frame,
             num_inference_steps
         )
         return generated_output
 
     def custom_loss(self, pred_noise, noisy_x, noise, steps):
-        # type: (Label, Label, Label, Int[Array, "batch"]) -> torch.Tensor
+        # type: (LabelBatch, LabelBatch, LabelBatch, Int[Array, "batch"]) -> Float[Array, "batch"]
         """Custom loss function for the SpeechToExpressionModel
+        """
+        pred_noise = pred_noise.unsqueeze(1)
+        loss_noisy = torch.nn.functional.mse_loss(pred_noise, noise)
+        return loss_noisy
 
+    def custom_loss2(self, pred_noise, noisy_x, noise, steps):
+        """
         We already know that the labels have some constraints. We can use this information to
         create a custom loss function.
 
@@ -171,7 +175,6 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
         pred_noise = pred_noise.unsqueeze(1)
         loss_noisy = torch.nn.functional.mse_loss(pred_noise, noise)
-        return loss_noisy
 
         # Calculate x0_pred
         alpha_t = self.diffusion.scheduler.alphas_cumprod[steps].to(noisy_x.device).view(-1, 1)

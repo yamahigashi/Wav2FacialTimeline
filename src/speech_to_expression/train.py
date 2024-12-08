@@ -76,8 +76,8 @@ def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
 
-    time_embed_dim = trial.suggest_int("time_embed_dim", 32, 2048)
-    # time_embed_dim = 512
+    # time_embed_dim = trial.suggest_int("time_embed_dim", 32, 2048)
+    time_embed_dim = 512
 
     # Suggest hyperparameters to tune
     hparams = config.SpeechToExpressionConfig(
@@ -146,7 +146,7 @@ def objective(trial):
     )
 
     # batch_size = trial.suggest_int("batch_size", 1, 8)
-    batch_size = 2
+    batch_size = 4
 
     # Create DataLoaders with the suggested batch size
     args = parse_args()

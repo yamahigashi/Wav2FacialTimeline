@@ -15,6 +15,14 @@ if typing.TYPE_CHECKING:
     from  typing import Generator  # noqa: F401
     from typing import Tuple  # noqa: F401
     from config import SpeechToExpressionConfig  # noqa: F401
+    from dataset import (
+        Batch,  # noqa: F401
+        BatchData,  # noqa: F401
+        PastFramesBatch,  # noqa: F401
+        FeatBatch, # noqa: F401
+        MaskBatch, # noqa: F401
+        LabelBatch, # noqa: F401
+    )
 
 
 ########################################################################################
@@ -44,7 +52,7 @@ def load_model(checkpoint_path, device):
 
 
 def preprocess_inference_data(audio_path, config):
-    # type: (str, SpeechToExpressionConfig) -> Generator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None, None]
+    # type: (str, SpeechToExpressionConfig) -> Generator[Batch, None, None]
     """Preprocess input data for inference with batching."""
 
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")

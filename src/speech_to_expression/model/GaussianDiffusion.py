@@ -107,10 +107,10 @@ class GaussianDiffusion(nn.Module):
         past_frame_masks,
         frame_masks,
         global_frame_masks,
-        current_short_frame,
-        current_long_frame,
         num_inference_steps=30
     ):
+        # type: (PastFramesBatch, FeatBatch, FeatBatch, MaskBatch, MaskBatch, MaskBatch, int) -> Noise
+
         batch_size = past_frames.size(0)
         device = past_frames.device
 

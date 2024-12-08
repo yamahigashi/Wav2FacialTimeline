@@ -18,12 +18,11 @@ if typing.TYPE_CHECKING:
     )
     from dataset import (
         Batch,  # noqa: F401
+        PastFramesBatch,  # noqa: F401
+        FeatBatch, # noqa: F401
+        MaskBatch, # noqa: F401
+        LabelBatch, # noqa: F401
     )
-
-    Label = Float[Array, "batch_size", "output_dim"]
-    FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
-    MaskSeq1st = Float[Array, "seq_len", "batch"]
-    MaskBatch1st = Float[Array, "batch", "seq_len"]
 
 
 class NoiseDecoder(nn.Module):
@@ -57,6 +56,7 @@ class NoiseDecoder(nn.Module):
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
 
     def forward(self, past_frames, noisy_x, st_latent, lt_latent, tgt_key_padding_mask):
+        # type: (PastFramesBatch, LabelBatch, FeatBatch, FeatBatch, MaskBatch) -> LabelBatch
         """
         Args:
             past_frames: (batch, num_past_frames, output_dim)
@@ -65,6 +65,8 @@ class NoiseDecoder(nn.Module):
                 ノイズが付与された予測対象フレーム
             st_latent: (seq_len_s, batch, embed_dim)
             lt_latent: (seq_len_l, batch, embed_dim)
+            tgt_key_padding_mask: (batch, num_past_frames)
+                過去フレームのマスク
 
         Returns:
             output: (batch, output_dim) 推定されたノイズ
