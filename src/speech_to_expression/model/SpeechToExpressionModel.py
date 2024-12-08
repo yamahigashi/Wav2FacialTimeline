@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 
-from . import (
+from model import (
     ShortTermTemporalModule,
     LongTermTemporalModule,
     NoiseDecoder,

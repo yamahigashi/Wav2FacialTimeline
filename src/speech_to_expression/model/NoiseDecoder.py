@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .. import utils
+import utils
 
 import typing
 if typing.TYPE_CHECKING:

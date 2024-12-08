@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import diffusers.schedulers
 
-from .. import config as conf
-from . import (
+import config as conf
+from model import (
     ShortTermTemporalModule,  # noqa: F401
     LongTermTemporalModule,  # noqa: F401
     NoiseDecoder,  # noqa: F401
@@ -24,12 +24,12 @@ if typing.TYPE_CHECKING:
     )
     from dataset import (
         Batch,  # noqa: F401
+        PastFramesBatch,  # noqa: F401
+        FeatBatch, # noqa: F401
+        MaskBatch, # noqa: F401
+        LabelBatch, # noqa: F401
     )
-
-    Label = Float[Array, "batch_size", "output_dim"]
-    FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
-    MaskSeq1st = Float[Array, "seq_len", "batch"]
-    MaskBatch1st = Float[Array, "batch", "seq_len"]
+    Noise = Float[Array, "batch", "seq_len", "output_dim"]
 
 
 class GaussianDiffusion(nn.Module):
@@ -81,6 +81,7 @@ class GaussianDiffusion(nn.Module):
         st_key_padding_mask,
         lt_key_padding_mask
     ):
+        # type: (PastFramesBatch, Noise, Int, FeatBatch, FeatBatch, MaskBatch, MaskBatch, MaskBatch) -> Noise
      
         # Ensure ts is within the valid range
         assert ts.max() < self.train_timesteps_num, "ts contains indices out of bounds for the embedding layer."
