@@ -314,3 +314,30 @@ def reverse_mean_and_std_normalization(data):
     data += MEAN
 
     return data.astype(np.float32)
+
+
+def find_closest_divisible_num_heads(embed_dim, target_num_heads, max_heads=16):
+    # type: (int, int, int) -> int
+    """
+    embed_dimを割り切れる、target_num_headsに最も近いnum_headsを見つける関数。
+    
+    Args:
+        embed_dim (int): 埋め込みの次元数
+        target_num_heads (int): 目標のヘッド数
+        max_heads (int): 最大のヘッド数の制限（デフォルトは16）
+
+    Returns:
+        int: target_num_headsに最も近い割り切れるnum_headsの値
+    """
+    # 上限を制限して、1 から max_heads の範囲で割り切れる num_heads を探す
+    possible_heads = []
+    for num_heads in range(1, max_heads + 1):
+        if embed_dim % num_heads == 0:
+            possible_heads.append(num_heads)
+
+    # 最も target_num_heads に近い値を選択
+    closest_num_heads = min(possible_heads, key=lambda x: abs(x - target_num_heads))
+    
+    return closest_num_heads
+
+

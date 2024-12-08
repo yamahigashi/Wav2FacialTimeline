@@ -8,11 +8,12 @@ from transformers import Wav2Vec2Processor, Wav2Vec2Model
 import pandas as pd
 
 import utils
-from model import SpeechToExpressionModel  # Assuming your model is saved here
+from model.SpeechToExpressionModel import SpeechToExpressionModel
 
 import typing
 if typing.TYPE_CHECKING:
     from  typing import Generator  # noqa: F401
+    from typing import Tuple  # noqa: F401
     from config import SpeechToExpressionConfig  # noqa: F401
 
 
@@ -30,17 +31,20 @@ def parse_args():
 
 
 def load_model(checkpoint_path, device):
+    # type: (str, torch.device) -> Tuple[SpeechToExpressionModel, SpeechToExpressionConfig]
     """Load the pre-trained model from a checkpoint and move it to the specified device."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    hparams = checkpoint["hyper_parameters"].copy()
-    model = SpeechToExpressionModel(**hparams)
+    config_dict = checkpoint["hyper_parameters"].get("SpeechToExpressionConfig", {})
+    config = SpeechToExpressionConfig(**config_dict)
+
+    model = SpeechToExpressionModel(config)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval().to(device)
-    return model, hparams
+    return model, config
 
 
-def preprocess_inference_data(audio_path, hparams):
-    # type: (str, dict) -> Generator
+def preprocess_inference_data(audio_path, config):
+    # type: (str, SpeechToExpressionConfig) -> Generator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None, None]
     """Preprocess input data for inference with batching."""
 
     wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
@@ -64,7 +68,7 @@ def preprocess_inference_data(audio_path, hparams):
             current_s_frame,
             current_l_frame
 
-        ) = get_audio_feature_parameters(audio_features, i, hparams)
+        ) = get_audio_feature_parameters(audio_features, i, config)
 
         # Pad sequences to the same length
         padded_s_term_batch = pad_sequence([s_term_features], batch_first=True)
@@ -77,15 +81,14 @@ def preprocess_inference_data(audio_path, hparams):
         yield padded_s_term_batch, padded_l_term_batch, padded_s_mask_batch, padded_l_mask_batch, s_frame, l_frame
 
 
-def get_audio_feature_parameters(audio_features, frame, hparams):
-    # type: (torch.Tensor, int, dict) -> ...
+def get_audio_feature_parameters(audio_features, frame, config):
+    # type: (torch.Tensor, int, SpeechToExpressionConfig) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
-    _hparams = hparams.get("config", None)  # type: SpeechToExpressionConfig
-    pst_window = _hparams.st.prev_window
-    nst_window = _hparams.st.next_window
-    plt_window = _hparams.lt.prev_window
-    nlt_window = _hparams.lt.next_window
-    embed_dim = _hparams.embed_dim
+    pst_window = config.st.prev_window
+    nst_window = config.st.next_window
+    plt_window = config.lt.prev_window
+    nlt_window = config.lt.next_window
+    embed_dim = config.embed_dim
 
     return utils.prepare_audio_features_and_masks(
         audio_features,
@@ -109,7 +112,6 @@ def run_inference(
         current_short_frame,
         current_long_frame,
         device,
-        hparams
 ):
     """Run inference on the given data."""
 
@@ -205,9 +207,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results = []
-    model, hparams = load_model(args.checkpoint, device)
+    model, config = load_model(args.checkpoint, device)
 
-    data_gen = preprocess_inference_data(args.input_file, hparams)
+    data_gen = preprocess_inference_data(args.input_file, config)
     past_frames = torch.zeros(1, NUM_FRAMES, 31).to(device)
     past_frame_masks = torch.ones(1, NUM_FRAMES).to(device)
     past_frame_masks[:, -1] = 0  # unmask the first frame
@@ -233,7 +235,6 @@ def main():
             current_short_frame,
             current_long_frame,
             device,
-            hparams
         )
 
         past_frames = torch.cat([past_frames, output], dim=1)

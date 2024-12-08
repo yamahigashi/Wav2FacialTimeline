@@ -16,10 +16,11 @@ if typing.TYPE_CHECKING:
     Feat = Float[Array, "seq_len", "embed_dim"]
     Mask = Float[Array, "seq_len"]
 
+    LabelBatch = Float[Array, "batch_size", "output_dim"]
     PastFramesBatch = Float[Array, "batch_size", "seq_len", "output_dim"]
     FeatBatch = Float[Array, "batch_size", "seq_len", "embed_dim"]
     MaskBatch = Float[Array, "batch_size", "seq_len"]
-    Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
+    Batch = tuple[PastFramesBatch, FeatBatch, FeatBatch, MaskBatch, MaskBatch, MaskBatch, Int, Int]
     BatchData = tuple[PastFrames, Feat, Feat, Mask, Mask, Mask, Int, Int]  # noqa: F401
 
 

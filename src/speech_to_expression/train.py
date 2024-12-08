@@ -16,7 +16,7 @@ from dataset import (
     SpeakerDataset,
     open_hdf5_file,
 )
-from model import SpeechToExpressionModel
+from model.SpeechToExpressionModel import SpeechToExpressionModel
 import config
 
         
@@ -76,8 +76,8 @@ def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
 
-    # time_embed_dim = trial.suggest_int("time_embed_dim", 32, 2048)
-    time_embed_dim = 512
+    time_embed_dim = trial.suggest_int("time_embed_dim", 32, 2048)
+    # time_embed_dim = 512
 
     # Suggest hyperparameters to tune
     hparams = config.SpeechToExpressionConfig(
@@ -85,33 +85,33 @@ def objective(trial):
         embed_dim=WAV2VEC2_EMBED_DIM,
         time_embed_dim=time_embed_dim,
         output_dim=FACIAL_FEATURE_DIM,
-        lr = 5e-05,
-        # lr = trial.suggest_float("lr", 1e-7, 1e-3),
+        # lr = 5e-05,
+        lr = trial.suggest_float("lr", 1e-7, 1e-3),
         st=config.ShortTermConfig(
             prev_window=3,
             next_window=6,
-            head_num=8,
-            # head_num=trial.suggest_int("st_head_num", 1, 16),
+            # head_num=8,
+            head_num=trial.suggest_int("st_head_num", 1, 16),
         ),
         lt=config.LongTermConfig(
             prev_window=50,
             next_window=150,
-            # head_num=trial.suggest_int("lt_head_num", 1, 16),
-            # layer_num=trial.suggest_int("lt_layer_num", 1, 8),
-            head_num=8,
-            layer_num=2,
+            head_num=trial.suggest_int("lt_head_num", 1, 16),
+            layer_num=trial.suggest_int("lt_layer_num", 1, 8),
+            # head_num=8,
+            # layer_num=2,
         ),
         diffusion=config.DiffusionConfig(
             loss_type="l1",
             noise_decoder_config=config.NoiseDecoderConfig(
-                # head_num=trial.suggest_int("noise_head_num", 1, 32),
-                # hidden_dim=trial.suggest_int("noise_hidden_dim", 32, 2048),
-                # layer_num=trial.suggest_int("noise_layer_num", 1, 8),
+                head_num=trial.suggest_int("noise_head_num", 1, 32),
+                hidden_dim=trial.suggest_int("noise_hidden_dim", 32, 2048),
+                layer_num=trial.suggest_int("noise_layer_num", 1, 8),
                 dim_feedforward=trial.suggest_int("noise_dim_feedforward", 32, 4096),
                 dropout=trial.suggest_float("noise_dropout", 0.1, 0.5),
-                head_num=10,
-                hidden_dim=1024,
-                layer_num=1,
+                # head_num=10,
+                # hidden_dim=1024,
+                # layer_num=1,
                 # dim_feedforward=4096,
                 # dropout=0.1,
             ),
@@ -135,18 +135,18 @@ def objective(trial):
 
     # Create PyTorch Lightning trainer
     trainer = pl.Trainer(
-        max_epochs=10,
-        logger=TensorBoardLogger("../logs/", name="optuna20241117"),
+        max_epochs=8,
+        logger=TensorBoardLogger("../logs/", name="optuna20241208_02"),
         callbacks=[val_loss_checkpoint, time_checkpoint, EarlyStopping(monitor="val_loss")],
-        accumulate_grad_batches=2,
-        gradient_clip_val=0.5,
+        accumulate_grad_batches=3,
+        # gradient_clip_val=0.5,
 
         accelerator=preferred_device,
         devices=num_devices,
     )
 
     # batch_size = trial.suggest_int("batch_size", 1, 8)
-    batch_size = 64
+    batch_size = 2
 
     # Create DataLoaders with the suggested batch size
     args = parse_args()
@@ -242,7 +242,7 @@ def main():
         study = optuna.create_study(
             direction="minimize",
             storage="sqlite:///optuna3.db",
-            study_name="speech_to_expression_b5",
+            study_name="speech_to_expression_2024-12-08_02",
             load_if_exists=True
         )
         study.optimize(objective, n_trials=100)
