@@ -7,8 +7,20 @@ import utils
 
 import typing
 if typing.TYPE_CHECKING:
+    from jaxtyping import (
+        Float,  # noqa: F401
+        Array,  # noqa: F401
+        Int,  # noqa: F401
+    )
+    PastFrames = Float[Array, "seq_len", "output_dim"]
+    Feat = Float[Array, "seq_len", "embed_dim"]
+    Mask = Float[Array, "seq_len"]
+
+    PastFramesBatch = Float[Array, "batch_size", "seq_len", "output_dim"]
+    FeatBatch = Float[Array, "batch_size", "seq_len", "embed_dim"]
+    MaskBatch = Float[Array, "batch_size", "seq_len"]
     Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
-    BatchData = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]  # noqa: F401
+    BatchData = tuple[PastFrames, Feat, Feat, Mask, Mask, Mask, Int, Int]  # noqa: F401
 
 
 class SpeakerDataset(Dataset):
@@ -44,8 +56,6 @@ class SpeakerDataset(Dataset):
         self.prev_long_term_window = prev_long_term_window
         self.next_long_term_window = next_long_term_window
 
-        # Open HDF5 file and retrieve all file names (keys) stored in the dataset
-        self.hdf5_file = h5py.File(hdf5_file, "r")
         self.hdf5_file = None
         self._initialize_file_offsets()
 
@@ -92,8 +102,22 @@ class SpeakerDataset(Dataset):
             raise RuntimeError("HDF5 file is not opened. Ensure `worker_init_fn` is used to open the file in each worker.")
 
         file_key, file_frame_idx = self._get_file_index(idx)
-        facial_expressions = self.hdf5_file[f"{file_key}/facial_expression"][:]
-        audio_features = self.hdf5_file[f"{file_key}/audio_feature"][:]
+
+        # Get the facial expression window width
+        facial_start_frame = max(0, file_frame_idx - self.prev_long_term_window)
+        facial_end_frame = file_frame_idx + 1
+        facial_expressions = self.hdf5_file[f"{file_key}/facial_expression"][facial_start_frame:facial_end_frame]
+
+        # Get the audio feature window width
+        audio_start_frame = max(0, file_frame_idx - max(self.prev_short_term_window, self.prev_long_term_window))
+        audio_end_frame = min(
+            self.hdf5_file[f"{file_key}/audio_feature"].shape[0], 
+            file_frame_idx + max(self.next_short_term_window, self.next_long_term_window) + 1
+        )
+        audio_features = self.hdf5_file[f"{file_key}/audio_feature"][audio_start_frame:audio_end_frame]
+
+        relative_audio_frame_idx = file_frame_idx - audio_start_frame
+        relative_facial_frame_idx = file_frame_idx - facial_start_frame
 
         (
             short_term_features,
@@ -105,7 +129,7 @@ class SpeakerDataset(Dataset):
 
         ) = utils.prepare_audio_features_and_masks(
             audio_features,
-            file_frame_idx,
+            relative_audio_frame_idx,
             self.prev_short_term_window,
             self.next_short_term_window,
             self.prev_long_term_window,
@@ -113,14 +137,24 @@ class SpeakerDataset(Dataset):
             self.embed_dim,
         )
 
-        labels = torch.tensor(facial_expressions[file_frame_idx], dtype=torch.float32)  # Label for the current frame
+        past_frames, past_frames_mask = utils.prepare_facial_features_and_masks(
+            facial_expressions,
+            relative_facial_frame_idx,
+            self.prev_long_term_window
+        )
 
-        if file_frame_idx == 0:
-            last_x = torch.zeros_like(labels)
-        else:
-            last_x = torch.tensor(facial_expressions[file_frame_idx - 1], dtype=torch.float32)
+        past_frames = utils.apply_mean_and_std_normalization(past_frames)
 
-        return last_x, short_term_features, long_term_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame, labels
+        return (
+            past_frames,
+            short_term_features,
+            long_term_features,
+            past_frames_mask,
+            short_frame_mask,
+            long_frame_mask,
+            current_short_frame,
+            current_long_frame
+        )
 
 
 def open_hdf5_file(_worker_id):

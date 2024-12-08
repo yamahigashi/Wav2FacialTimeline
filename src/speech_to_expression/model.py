@@ -23,7 +23,6 @@ if typing.TYPE_CHECKING:
     )
 
     Label = Float[Array, "batch_size", "output_dim"]
-    FeatSeq1st = Float[Array, "seq_len", "batch", "embed_dim"]
     FeatBatch1st = Float[Array, "batch", "seq_len", "embed_dim"]
     MaskSeq1st = Float[Array, "seq_len", "batch"]
     MaskBatch1st = Float[Array, "batch", "seq_len"]
@@ -67,19 +66,23 @@ class ShortTermTemporalModule(nn.Module):
         """
         super(ShortTermTemporalModule, self).__init__()
         num_heads = find_closest_divisible_num_heads(embed_dim, num_heads)
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+        self.attention = nn.MultiheadAttention(
+            embed_dim,
+            num_heads,
+            batch_first=True
+        )
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, st_features, st_key_padding_mask, timestep_emb):
-        # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
+        # type: (FeatBatch1st, MaskBatch1st, Float[Array, "batch"]) -> FeatBatch1st
         """Forward pass of the ShortTermTemporalModule
 
         Args:
             st_features (torch.Tensor): The input frame features
         """
 
-        seq_len, batch_size, _ = st_features.size()
-        timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
+        batch_size, seq_len, _ = st_features.size()
+        timestep_emb_expanded = timestep_emb.unsqueeze(1).expand(batch_size, seq_len, -1)
         st_features = torch.cat([st_features, timestep_emb_expanded], dim=-1)
 
         attn_output, _ = self.attention(
@@ -114,7 +117,7 @@ class LongTermTemporalModule(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, lt_features, src_key_padding_mask, timestep_emb):
-        # type: (FeatSeq1st, MaskBatch1st, Float[Array, "batch"]) -> FeatSeq1st
+        # type: (FeatBatch1st, MaskBatch1st, Float[Array, "batch"]) -> FeatBatch1st
         """Forward pass of the LongTermTemporalModule
 
         The input features should be in the sequence-first format, Transfomer expects the input to be
@@ -129,8 +132,8 @@ class LongTermTemporalModule(nn.Module):
             torch.Tensor: Output of the transformer encoder
         """
 
-        seq_len, batch_size, _ = lt_features.size()
-        timestep_emb_expanded = timestep_emb.unsqueeze(0).expand(seq_len, batch_size, -1)
+        batch_size, seq_len, _ = lt_features.size()
+        timestep_emb_expanded = timestep_emb.unsqueeze(1).expand(batch_size, seq_len, -1)
         lt_features = torch.cat([lt_features, timestep_emb_expanded], dim=-1)
 
         attn_output = self.transformer_encoder(
@@ -143,83 +146,89 @@ class LongTermTemporalModule(nn.Module):
         return output
 
 
-class PositionalEncoding(pl.LightningModule):
+class PositionalEncoding(nn.Module):
     """Positional Encoding Module"""
 
     def __init__(self, embed_dim, max_len):
         # type: (int, int) -> None
-
         super(PositionalEncoding, self).__init__()
 
-        # Absolute positional encoding using sine and cosine functions
+        self.max_len = max_len
+
+        # Create positional encoding (seq_len, embed_dim)
         pe = torch.zeros(max_len, embed_dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / embed_dim))
         pe[:, 0::2] = torch.sin(position * div_term)  # Even indices
         pe[:, 1::2] = torch.cos(position * div_term)  # Odd indices
-        pe = pe.unsqueeze(1)  # (max_len, 1, embed_dim)
+
+        # Register as buffer: pe is (max_len, embed_dim)
         self.register_buffer("pe", pe)
 
-        # Temporal encoding (1) for past, (2) for present, and (3) for future
+        # Temporal encoding (1) for past, (2) for present, (3) for future
         self.temporal_embeddings = nn.Embedding(3, embed_dim)
 
     def forward(self, x, current_frame_idx):
-        # type: (FeatSeq1st, Int[Array, "batch"]) -> FeatSeq1st
+        # type: (torch.Tensor, torch.Tensor) -> torch.Tensor
         """
         Args:
-            x (torch.Tensor): 入力テンソル（形状： (seq_len, batch_size, embed_dim)）
-            current_frame_idx (torch.Tensor): 各バッチの現在フレームのインデックス（形状： (batch_size,)）
+            x (torch.Tensor): 入力テンソル（形状： (batch_size, seq_len, embed_dim)）
+            current_frame_idx (torch.Tensor): (batch_size,) 各バッチの現在フレームのインデックス
 
         Returns:
             torch.Tensor: 位置エンコーディングと時間的エンコーディングが付加された入力テンソル
+                          (batch_size, seq_len, embed_dim)
         """
-        seq_len, batch_size, embed_dim = x.size()
+        batch_size, seq_len, embed_dim = x.size()
         device = x.device
+        assert seq_len <= self.max_len
 
-        # Get the positional encoding
-        pe = self.pe[:seq_len, :].to(device)  # (seq_len, 1, embed_dim)
-        pe = pe.expand(-1, batch_size, -1)    # (seq_len, batch_size, embed_dim)
+        # Positional encodingを展開: peは(max_len, embed_dim)で定義済み
+        # ここでseq_len分取り出し、(batch_size, seq_len, embed_dim)に拡張
+        pe = self.pe[:seq_len, :].to(device)              # (seq_len, embed_dim)
+        pe = pe.unsqueeze(0).expand(batch_size, seq_len, embed_dim)  # (batch_size, seq_len, embed_dim)
 
-        # Calculate the temporal indices
-        frame_indices = torch.arange(seq_len, device=device).unsqueeze(1)  # type: Int[Array, "seq_len", 1, "batch"]
-        frame_indices = frame_indices.expand(-1, batch_size)  # type: Int[Array, "seq_len", "batch", "embed_dim"]
-        current_frame_idx_expanded = current_frame_idx.unsqueeze(0).expand(seq_len, batch_size)
+        # Temporal indicesの計算
+        # frame_indices: (batch_size, seq_len) 各サンプルで0からseq_len-1まで
+        frame_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+        frame_indices = frame_indices.expand(batch_size, seq_len)  # (batch_size, seq_len)
 
-        temporal_indices = torch.zeros((seq_len, batch_size), dtype=torch.long, device=device)
+        # current_frame_idx: (batch_size,) -> (batch_size, seq_len)
+        current_frame_idx_expanded = current_frame_idx.unsqueeze(1).expand(batch_size, seq_len)
+
+        # temporal_indicesを計算 (0: past, 1: present, 2: future)
+        temporal_indices = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
         temporal_indices[frame_indices < current_frame_idx_expanded] = 0  # past
         temporal_indices[frame_indices == current_frame_idx_expanded] = 1  # present
         temporal_indices[frame_indices > current_frame_idx_expanded] = 2  # future
 
-        # Get the temporal embeddings
-        temporal_encodings = self.temporal_embeddings(temporal_indices)  # (seq_len, batch_size, embed_dim)
+        # temporal_encodings: (batch_size, seq_len, embed_dim)
+        temporal_encodings = self.temporal_embeddings(temporal_indices)
 
-        # Add the positional and temporal encodings
+        # x, pe, temporal_encodingsを加算
         x = x + pe + temporal_encodings
 
+        # nan or infがあるか確認
+        if not torch.isfinite(x).all():
+            print("Found NaN or infinite values in the output of PositionalEncoding")
         return x
 
 
 class NoiseDecoder(nn.Module):
-
     def __init__(self, config, output_dim, embed_dim):
-        # type: (conf.NoiseDecoderConfig, int, int) -> None
-
         super().__init__()
         self.hidden_dim = config.hidden_dim
         num_heads = find_closest_divisible_num_heads(self.hidden_dim, config.head_num)
 
-        # Project input features to hidden dimensions
-        self.query_proj = nn.Linear(output_dim * 2, self.hidden_dim)
-        self.key_proj = nn.Linear(embed_dim, self.hidden_dim)
-        self.value_proj = nn.Linear(embed_dim, self.hidden_dim)
+        # 入力次元を hidden_dim に射影する層
+        self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
+        self.tgt_proj = nn.Linear(output_dim, self.hidden_dim)
 
-        # Transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.hidden_dim,
             nhead=num_heads,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            activation="relu"
             activation="relu",
             batch_first=True
         )
@@ -228,53 +237,55 @@ class NoiseDecoder(nn.Module):
             num_layers=config.layer_num
         )
 
-        # Output layer
         self.output_layer = nn.Linear(self.hidden_dim, output_dim)
-
-        # Layer normalization
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
 
-    def forward(self, xcur, xnext, st_latent, lt_latent):
+    def forward(self, past_frames, noisy_x, st_latent, lt_latent, tgt_key_padding_mask):
         """
         Args:
-            xcur (Tensor): Current noisy input (batch_size, output_dim)
-            xnext (Tensor): Next noisy input (batch_size, output_dim)
-            st_latent (Tensor): Short-term features (seq_len_s, batch_size, embed_dim)
-            lt_latent (Tensor): Long-term features (seq_len_l, batch_size, embed_dim)
-        
+            past_frames: (batch, num_past_frames, output_dim)
+                過去フレームの特徴列
+            noisy_x: (batch, output_dim)
+                ノイズが付与された予測対象フレーム
+            st_latent: (seq_len_s, batch, embed_dim)
+            lt_latent: (seq_len_l, batch, embed_dim)
+
         Returns:
-            Tensor: Estimated noise (batch_size, output_dim)
+            output: (batch, output_dim) 推定されたノイズ
         """
-        # Prepare queries
-        queries = torch.cat([xcur, xnext], dim=-1)  # (batch_size, output_dim * 2)
-        queries = self.query_proj(queries)          # (batch_size, hidden_dim)
-        queries = queries.unsqueeze(0)              # (1, batch_size, hidden_dim)
 
-        # Prepare keys and values
-        # Concatenate short-term and long-term features along the sequence dimension
-        kv_features = torch.cat([st_latent, lt_latent], dim=0)  # (seq_len, batch_size, embed_dim)
-        keys = self.key_proj(kv_features)    # (seq_len, batch_size, hidden_dim)
-        # values = self.value_proj(kv_features)  # (seq_len, batch_size, hidden_dim)
+        batch_size = past_frames.size(0)  # noqa: F841
+        num_past_frames = past_frames.size(1)  # noqa: F841
 
-        # Transformer decoder expects target sequence first
-        # Since we have only one query, the target sequence length is 1
-        # The memory (keys and values) is the concatenated temporal features
-
-        # Pass through the Transformer decoder
-        decoder_output = self.transformer_decoder(
-            tgt=queries,
-            memory=keys,
-            tgt_mask=None,
-            memory_mask=None,
-            tgt_key_padding_mask=None,
-            memory_key_padding_mask=None  # You can provide masks if needed
+        # 過去フレーム列の末尾に noisy_x (予測対象フレーム) を追加
+        # tgt: (batch, num_past_frames+1, output_dim)
+        tgt = torch.cat([past_frames, noisy_x], dim=1)
+        new_mask_column = torch.zeros((tgt.size(0), 1), dtype=torch.bool, device=tgt.device)
+        tgt_key_padding_mask = torch.cat(
+            [tgt_key_padding_mask, new_mask_column],  # (batch, num_past_frames+1)
+            dim=1
         )
 
-        decoder_output = self.layer_norm(decoder_output)  # (1, batch_size, hidden_dim)
-        decoder_output = decoder_output.squeeze(0)        # (batch_size, hidden_dim)
+        # ターゲット系列を hidden_dim に射影
+        tgt = self.tgt_proj(tgt)  # (batch, num_past_frames+1, hidden_dim)
 
-        # Output layer
-        output = self.output_layer(decoder_output)  # (batch_size, output_dim)
+        # メモリ（キー・バリュー）は短期・長期特徴の結合
+        kv_features = torch.cat([st_latent, lt_latent], dim=1)  # (batch, seq_len, embed_dim)
+        memory = self.input_proj(kv_features)                  # (batch, seq_len, hidden_dim)
+
+        # Transformer Decoderの実行
+        # tgt: (batch, num_past_frames+1, hidden_dim)
+        # memory: (batch, seq_len, hidden_dim)
+        decoder_output = self.transformer_decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )
+        decoder_output = self.layer_norm(decoder_output)  # (batch, num_past_frames+1, hidden_dim)
+
+        # 最後のトークン位置が予測対象
+        predicted = decoder_output[:, -1, :]   # (batch, hidden_dim)
+        output = self.output_layer(predicted)  # (batch, output_dim)
 
         return output
 
@@ -319,15 +330,15 @@ class GaussianDiffusion(pl.LightningModule):
 
     def forward(
         self,
-        cur_x,
-        next_x,
+        past_frames,
+        noisy_x,
         ts,
         st_features,
         lt_features,
+        tgt_key_padding_mask,
         st_key_padding_mask,
         lt_key_padding_mask
     ):
-        # type: (Label, Label, Int[Array, "batch"], FeatSeq1st, FeatSeq1st, MaskBatch1st, MaskBatch1st) -> Label
      
         # Ensure ts is within the valid range
         assert ts.max() < self.train_timesteps_num, "ts contains indices out of bounds for the embedding layer."
@@ -335,7 +346,13 @@ class GaussianDiffusion(pl.LightningModule):
         st_latent = self.short_term_module(st_features, st_key_padding_mask, timestep_emb)
         lt_latent = self.long_term_module(lt_features, lt_key_padding_mask, timestep_emb)
 
-        estimated = self.model(cur_x, next_x, st_latent, lt_latent)
+        estimated = self.model(
+            past_frames,
+            noisy_x,
+            st_latent,
+            lt_latent,
+            tgt_key_padding_mask
+        )
 
         return estimated
 
@@ -431,17 +448,17 @@ class SpeechToExpressionModel(pl.LightningModule):
 
     def forward(
         self,
-        input_last_x,
+        past_frames,
         current_x,
         ts,
         st_features,
         lt_features,
+        past_mask,
         frame_masks,
         global_frame_masks,
         current_short_frame,
         current_long_frame,
     ):
-        # type: (Label, Label, int, FeatBatch1st, FeatBatch1st, MaskBatch1st, MaskBatch1st, Int[Array, "batch"], Int[Array, "batch"]) -> Label
         """Forward pass of the SpeechToExpressionModel.
 
         First, the short-term temporal attention module is applied to the frame features.
@@ -465,11 +482,12 @@ class SpeechToExpressionModel(pl.LightningModule):
         lt_encoded = self.long_positional_encoding(lt_features, current_long_frame)
 
         estimated = self.diffusion(
-            input_last_x,
+            past_frames,
             current_x,
             ts,
             st_encoded,
             lt_encoded,
+            past_mask,
             frame_masks,
             global_frame_masks
         )
@@ -517,7 +535,8 @@ class SpeechToExpressionModel(pl.LightningModule):
             Range of [0:28] is 0 - 1.0
             Sum of [21:28] is 1.0
         """
-        loss_noisy = torch.nn.functional.mse_loss(pred_noise, noise)
+        loss_noisy = torch.nn.functional.mse_loss(pred_noise, noisy_x[:, -1, :])
+        return loss_noisy
 
         # Calculate x0_pred
         alpha_t = self.diffusion.scheduler.alphas_cumprod[steps].to(noisy_x.device).view(-1, 1)
@@ -557,22 +576,27 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         (
-            input_last_x,
+            input_frames,
             st_features,
             lt_features,
+            input_frames_mask,
             frame_masks,
             global_frame_masks,
             current_short_frame,
             current_long_frame,
-            labels
         ) = batch
+
+        batch_size = input_frames.size(0)
+        labels = input_frames[:, -1:, :]
+        past_frames = input_frames[:, :-1, :]  # 最後のフレームは現在フレームなので除外
+        past_frame_masks = input_frames_mask[:, :-1]  # 最後のフレームは現在フレームなので除外
 
         device = st_features.device
         noise = torch.randn_like(labels).to(device)
         steps = torch.randint(
             0,
             self.diffusion.scheduler.config.num_train_timesteps,
-            (input_last_x.size(0),),
+            (batch_size,),
             device=device
         )
 
@@ -581,16 +605,21 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         # モデルの順伝播
         residual = self(
-            input_last_x,
+            past_frames,
             noisy_x,
             steps,
             st_features,
             lt_features,
+            past_frame_masks,
             frame_masks,
             global_frame_masks,
             current_short_frame,
             current_long_frame,
         )
+        mean = torch.mean(residual)
+        std = torch.std(residual)
+        self.log("residual mean", mean)
+        self.log("residual std", std)
 
         # 損失の計算
         loss = self.custom_loss(residual, noisy_x, noise, steps)
@@ -609,22 +638,27 @@ class SpeechToExpressionModel(pl.LightningModule):
         """
 
         (
-            input_last_x,
+            input_frames,
             st_features,
             lt_features,
+            input_frames_mask,
             frame_masks,
             global_frame_masks,
             current_short_frame,
             current_long_frame,
-            labels
         ) = batch
+
+        batch_size = input_frames.size(0)
+        labels = input_frames[:, -1:, :]
+        past_frames = input_frames[:, :-1, :]  # 最後のフレームは現在フレームなので除外
+        past_frame_masks = input_frames_mask[:, :-1]  # 最後のフレームは現在フレームなので除外
 
         device = st_features.device
         noise = torch.randn_like(labels).to(device)
         steps = torch.randint(
             0,
             self.diffusion.scheduler.config.num_train_timesteps,
-            (input_last_x.size(0),),
+            (batch_size,),
             device=device
         )
 
@@ -632,11 +666,12 @@ class SpeechToExpressionModel(pl.LightningModule):
 
         # モデルの順伝播
         residual = self(
-            input_last_x,
+            past_frames,
             noisy_x,
             steps,
             st_features,
             lt_features,
+            past_frame_masks,
             frame_masks,
             global_frame_masks,
             current_short_frame,

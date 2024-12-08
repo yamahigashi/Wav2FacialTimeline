@@ -180,78 +180,6 @@ def show_best_parameters(study):
 ##################################################################################################
 
 
-def collate_fn(batch):
-    # type: (list[Batch]) -> BatchData
-    """Collate function to pad and stack the batch of sequences.
-    Padding is done to ensure that all sequences have the same length. And
-    masks are created to ignore the padded elements during training.
-    
-    Args:
-        batch (list): List of tuples containing short-term features, long-term features, and labels.
-
-    Returns:
-        tuple: A tuple containing the padded short-term features, long-term features, labels, and masks.
-    """
-
-    (
-        input_last_x,
-        short_term_features,
-        long_term_features,
-        short_term_masks,
-        long_term_masks,
-        current_short_frame,
-        current_long_frame,
-        labels
-    )= zip(*batch)
-
-    # Get the lengths of each sequence
-    short_term_lengths = [x.shape[0] for x in short_term_features]
-    long_term_lengths = [x.shape[0] for x in long_term_features]
-
-    max_short_term_len = max(short_term_lengths)
-    max_long_term_len = max(long_term_lengths)
-
-    # Create masks for ignoring padded elements
-    short_term_padded = []
-    short_term_masks = []
-    for x, l in zip(short_term_features, short_term_lengths):
-        padding = max_short_term_len - l
-        short_term_padded.append(F.pad(x, (0, 0, 0, padding)))
-        mask = [False] * l + [True] * padding
-        short_term_masks.append(mask)
-
-    long_term_padded = []
-    long_term_masks = []
-    for x, l in zip(long_term_features, long_term_lengths):
-        padding = max_long_term_len - l
-        long_term_padded.append(F.pad(x, (0, 0, 0, padding)))
-        mask = [False] * l + [True] * padding
-        long_term_masks.append(mask)
-
-    # Convert to tensors
-    short_term_batch = torch.stack(short_term_padded)
-    long_term_batch = torch.stack(long_term_padded)
-    short_term_masks = torch.tensor(short_term_masks)
-    long_term_masks = torch.tensor(long_term_masks)
-
-    labels_batch = torch.stack(labels)
-    input_last_x_batch = torch.stack(input_last_x)
-
-    current_short_frame_batch = torch.tensor(current_short_frame)
-    current_long_frame_batch = torch.tensor(current_long_frame)
-
-    return (
-        input_last_x_batch,
-        short_term_batch,
-        long_term_batch,
-        short_term_masks,
-        long_term_masks,
-        current_short_frame_batch,
-        current_long_frame_batch,
-        labels_batch
-    )
-
-
 def prepare_dataloaders(
         hdf5_file,
         prev_short_term_window,
@@ -284,7 +212,6 @@ def prepare_dataloaders(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
         num_workers=num_workers,
         worker_init_fn=open_hdf5_file,
         persistent_workers=True
@@ -294,7 +221,6 @@ def prepare_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_fn,
         num_workers=num_workers,
         worker_init_fn=open_hdf5_file,
         persistent_workers=True

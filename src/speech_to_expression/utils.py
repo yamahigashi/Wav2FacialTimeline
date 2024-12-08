@@ -15,6 +15,24 @@ if typing.TYPE_CHECKING:
     from transformers import Wav2Vec2Processor, Wav2Vec2Model
 
 
+MEAN = np.array([
+    9.9547e-01,  5.5478e-01,  3.5493e-01,  3.6727e-01,  3.6637e-01,
+    2.3827e-01,  3.0750e-01,  2.4124e-01,  2.1665e-01,  5.0878e-01,
+    1.9951e-01,  3.3968e-01,  4.1550e-01,  4.3008e-01,  3.7704e-01,
+    4.0904e-01,  2.3289e-01,  7.1519e-01,  4.8964e-01,  1.8028e-01,
+    2.3140e-01,  1.2828e-01,  6.0053e-02,  7.2398e-02,  7.9008e-02,
+    9.7008e-02,  2.4460e-01,  3.1827e-01, -1.0843e-03, -2.2771e-05,
+    1.5233e-04
+]).astype(np.float32)
+
+STD = np.array([
+    0.0293, 0.1849, 0.1850, 0.2320, 0.1162, 0.1837, 0.4258, 0.1628, 0.2931,
+    0.4567, 0.2299, 0.1891, 0.1888, 0.1085, 0.4687, 0.1591, 0.2064, 0.3505,
+    0.2641, 0.1743, 0.2658, 0.2270, 0.1780, 0.1759, 0.1970, 0.1839, 0.3139,
+    0.3375, 1.0733, 0.8360, 1.2791
+]).astype(np.float32)
+
+
 def extract_facial_expression(file, feat_detector):
     # type: (str, Detector) -> pd.DataFrame
     """Extract facial expression data using py-feat."""
@@ -189,16 +207,6 @@ def prepare_audio_features_and_masks(
     # Create masks based on whether the frame is near the start or end of the sequence
     short_frame_mask = calculate_frame_masks(audio_length, frame, prev_short_window, next_short_window)
     long_frame_mask = calculate_frame_masks(audio_length, frame, prev_long_window, next_long_window)
-    # 
-    # if st_features.shape[0] > audio_length:
-    #     st_features = st_features[:audio_length]
-    # if lt_features.shape[0] > audio_length:
-    #     lt_features = lt_features[:audio_length]
-    # 
-    # if long_frame_mask.shape[0] > audio_length:
-    #     long_frame_mask = long_frame_mask[:audio_length]
-    # if short_frame_mask.shape[0] > audio_length:
-    #     short_frame_mask = short_frame_mask[:audio_length]
 
     current_short_frame = torch.tensor(max(0, frame - st_start))
     current_long_frame = torch.tensor(max(0, frame - lt_start))
@@ -206,20 +214,103 @@ def prepare_audio_features_and_masks(
     return st_features, lt_features, short_frame_mask, long_frame_mask, current_short_frame, current_long_frame
 
 
+def prepare_facial_features_and_masks(
+    facial_features,
+    frame,
+    prev_window,
+):
+    # type: (torch.Tensor, int, int) -> tuple[torch.Tensor, torch.Tensor]
+    """
+    Prepare audio features and corresponding masks for short-term and long-term windows centered around a specific frame.
+
+    This function extracts short-term and long-term audio feature windows centered at a given frame index. It also generates masks for these windows to handle padding or variable sequence lengths in batch processing. Additionally, it calculates the position of the current frame within each window.
+
+    Args:
+        facial_features (torch.Tensor): The full sequence of audio feature vectors with shape `(sequence_length, feature_dim)`.
+        frame (int): The index of the current frame in the sequence.
+        prev_window (int): Number of previous frames to include in the long-term window.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            - **long_term_features** (`torch.Tensor`): Extracted long-term audio features with shape `(long_window_length, feature_dim)`.
+            - **long_frame_mask** (`torch.Tensor`): Mask for the long-term window indicating valid positions.
+    """
+    facial_length = facial_features.shape[0]
+
+    assert frame >= 0, "Frame index must be non-negative."
+    assert prev_window >= 0, "Previous long-term window must be non-negative."
+
+    lt_start = min(prev_window, frame)
+    lt_end   = facial_length - frame - 1
+
+    # Define the range for long-term memory (past and future)
+    lt_start = max(0, frame - lt_start)  # Past frames
+    lt_end = min(len(facial_features), frame + lt_end + 1)  # Future frames
+    lt_prev_pad = abs(min(frame - prev_window, 0))
+
+    # Get the short-term and long-term features
+    lt_frames = facial_features[lt_start:lt_end]
+
+    # Convert to tensors
+    lt_features = torch.tensor(lt_frames, dtype=torch.float32)
+
+    # Pad or truncate the long-term features
+    lt_features = F.pad(lt_features, (0, 0, lt_prev_pad, 0))
+    lt_features = lt_features[:prev_window + 1]  # past frames + current frame
+
+    # Create masks based on whether the frame is near the start or end of the sequence
+    long_frame_mask = calculate_frame_masks(facial_length, frame, prev_window, 0)
+    # ensure the current frame and current frame - 1 are not masked
+    long_frame_mask[-1] = False
+    long_frame_mask[-2] = False
+
+    return lt_features, long_frame_mask
+
+
 def calculate_frame_masks(total_length, current_frame, prev_window, next_window):
-    # type: (int, int, int, int) -> torch.Tensor
-    """Calculate the frame masks for the given frame index."""
+    """
+    現在フレームを中心としたウィンドウ(prev_window + 1 + next_windowフレーム分)に対するマスクを計算します。
 
-    prev_masks = torch.zeros(prev_window, dtype=torch.bool)
-    prev_masks[:max(-prev_window, current_frame - prev_window)] = True
+    マスクはBoolの1次元テンソルを返し、ウィンドウ内の各フレームがデータ範囲内に存在しない場合はTrue(無効)、
+    存在する場合はFalse(有効)となります。
 
-    next_masks = torch.zeros(next_window, dtype=torch.bool)
-    next_masks[min(next_window, (total_length - current_frame)):] = True
+    Args:
+        total_length (int): 全フレーム数
+        current_frame (int): 現在のフレームインデックス
+        prev_window (int): 現在フレーム前に遡るフレーム数
+        next_window (int): 現在フレーム後のフレーム数
 
-    masks = torch.cat((
-        prev_masks,
-        torch.zeros(1, dtype=torch.bool),  # Current frame is always mask False
-        next_masks
-    ))
+    Returns:
+        torch.Tensor: 形状 (prev_window+1+next_window,) のブール型テンソル
+                      Trueはそのフレームが利用不可(マスクされるべき)であることを意味します。
+    """
+    # window_length = prev_window + 1 + next_window
+    # ウィンドウ内フレームのインデックスを計算
+    frame_indices = np.arange(current_frame - prev_window, current_frame + next_window + 1)
 
-    return masks
+    # データ範囲外のインデックスはTrueでマスク
+    mask = (frame_indices < 0) | (frame_indices >= total_length)
+
+    return torch.tensor(mask, dtype=torch.bool)
+
+
+def apply_mean_and_std_normalization(data):
+    # type: (np.ndarray) -> np.ndarray
+    """Apply mean and standard deviation normalization to the data."""
+
+    data -= MEAN
+    data /= (STD + 1e-8)
+
+    return data
+
+
+def reverse_mean_and_std_normalization(data):
+    # type: (np.ndarray) -> np.ndarray
+    """Reverse the mean and standard deviation normalization of the data."""
+
+    if isinstance(data, torch.Tensor):
+        data = data.cpu().numpy()
+    data *= (STD + 1e-8)
+    data += MEAN
+
+    return data.astype(np.float32)
