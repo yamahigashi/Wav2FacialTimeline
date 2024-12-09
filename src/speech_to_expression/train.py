@@ -72,6 +72,23 @@ def parse_args():
 
 
 ##################################################################################################
+class StopIfNotUnderThresholdByEpoch(pl.Callback):
+    """PyTorch Lightning callback to stop training if the validation loss is not under a threshold by a certain epoch."""
+
+    def __init__(self, target_epoch: int, threshold: float, monitor: str = "val_loss"):
+        super().__init__()
+        self.target_epoch = target_epoch
+        self.threshold = threshold
+        self.monitor = monitor
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.current_epoch == self.target_epoch - 1:
+            current_val_loss = trainer.callback_metrics.get(self.monitor, None)
+            if current_val_loss is not None:
+                if current_val_loss >= self.threshold:
+                    trainer.should_stop = True
+
+
 def objective(trial):
     # type: (optuna.Trial) -> float
     """Objective function for Optuna to optimize hyperparameters."""
@@ -133,11 +150,18 @@ def objective(trial):
         train_time_interval=timedelta(minutes=30),
     )
 
+    stop_if_not_under_threshold = StopIfNotUnderThresholdByEpoch(2, 0.8)
+
     # Create PyTorch Lightning trainer
     trainer = pl.Trainer(
         max_epochs=8,
         logger=TensorBoardLogger("../logs/", name="optuna20241208_02"),
-        callbacks=[val_loss_checkpoint, time_checkpoint, EarlyStopping(monitor="val_loss")],
+        callbacks=[
+            val_loss_checkpoint,
+            time_checkpoint,
+            stop_if_not_under_threshold,
+            EarlyStopping(monitor="val_loss")
+        ],
         accumulate_grad_batches=3,
         # gradient_clip_val=0.5,
 
@@ -300,6 +324,13 @@ def main():
     else:
         # Initialize the model
         model = SpeechToExpressionModel(hparams)
+
+    print("training...")
+    print("batch_size: ", args.batch_size)
+    print("learning_rate: ", args.learning_rate)
+    print("num_epochs: ", args.num_epochs)
+    print("config_file: ", args.config_file)
+    print("hparams: ", hparams)
 
     # Set up logging using TensorBoard
     log_dir = pathlib.Path(__file__).parent.parent.parent / "logs"

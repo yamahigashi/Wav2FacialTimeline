@@ -254,12 +254,14 @@ class SpeechToExpressionModel(pl.LightningModule):
             current_short_frame,
             current_long_frame,
         )
+
+        # If the model is learning the noise distribution correctly
+        # mean is expected to be close to 0, std is expected to be close to 1 
         mean = torch.mean(pred_noise)
         std = torch.std(pred_noise)
         self.log("pred_noise mean", mean)
         self.log("pred_noise std", std)
 
-        # 損失の計算
         loss = self.custom_loss(pred_noise, noisy_x, noise, steps)
 
         self.log("train_loss", loss, prog_bar=True)
