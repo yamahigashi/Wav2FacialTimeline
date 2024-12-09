@@ -9,12 +9,12 @@ import pandas as pd
 
 import utils
 from model.SpeechToExpressionModel import SpeechToExpressionModel
+from config import SpeechToExpressionConfig
 
 import typing
 if typing.TYPE_CHECKING:
     from  typing import Generator  # noqa: F401
     from typing import Tuple  # noqa: F401
-    from config import SpeechToExpressionConfig  # noqa: F401
     from dataset import (
         Batch,  # noqa: F401
         BatchData,  # noqa: F401
@@ -42,8 +42,7 @@ def load_model(checkpoint_path, device):
     # type: (str, torch.device) -> Tuple[SpeechToExpressionModel, SpeechToExpressionConfig]
     """Load the pre-trained model from a checkpoint and move it to the specified device."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    config_dict = checkpoint["hyper_parameters"].get("SpeechToExpressionConfig", {})
-    config = SpeechToExpressionConfig(**config_dict)
+    config = checkpoint["hyper_parameters"].get("config")
 
     model = SpeechToExpressionModel(config)
     model.load_state_dict(checkpoint["state_dict"])
